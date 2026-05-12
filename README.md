@@ -1,4 +1,4 @@
-# nixos-autoupdate
+# nixos-autoupdate (EXPERIMENTAL / WIP)
 
 A NixOS module that automatically pulls configuration from a git repository and rebuilds the system.
 
@@ -33,18 +33,18 @@ Supports age-encrypted SSH keys for private repository authentication.
 
 ## Options
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `enable` | bool | `false` | Enable the module |
-| `repoUrl` | string | — | Git repository URL |
-| `branch` | string | `"main"` | Branch to track |
-| `flakeOutput` | string | `"nixos"` | Flake output to activate |
-| `repoPath` | path | `"/var/lib/nixos-mgmt/repo"` | Local bare clone path |
-| `frequency` | string | `"10min"` | Check interval (systemd timer format) |
-| `ageKeyPath` | nullOr path | `null` | Age private key path (for agenix + gitSshKey) |
-| `gitSshKey` | nullOr path | `null` | Age-encrypted SSH key for git auth |
-| `rebuildCommand` | string | `"nixos-rebuild switch --flake $FLAKE_REF --fast"` | Command to rebuild the system |
-| `notifyOnFailure` | bool | `false` | Notify on failures (requires notifier) |
+| Option            | Type        | Default                                            | Description                                   |
+| ----------------- | ----------- | -------------------------------------------------- | --------------------------------------------- |
+| `enable`          | bool        | `false`                                            | Enable the module                             |
+| `repoUrl`         | string      | —                                                  | Git repository URL                            |
+| `branch`          | string      | `"main"`                                           | Branch to track                               |
+| `flakeOutput`     | string      | `"nixos"`                                          | Flake output to activate                      |
+| `repoPath`        | path        | `"/var/lib/nixos-mgmt/repo"`                       | Local bare clone path                         |
+| `frequency`       | string      | `"10min"`                                          | Check interval (systemd timer format)         |
+| `ageKeyPath`      | nullOr path | `null`                                             | Age private key path (for agenix + gitSshKey) |
+| `gitSshKey`       | nullOr path | `null`                                             | Age-encrypted SSH key for git auth            |
+| `rebuildCommand`  | string      | `"nixos-rebuild switch --flake $FLAKE_REF --fast"` | Command to rebuild the system                 |
+| `notifyOnFailure` | bool        | `false`                                            | Notify on failures (requires notifier)        |
 
 ## Testing
 
