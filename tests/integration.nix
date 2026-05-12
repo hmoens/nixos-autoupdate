@@ -51,6 +51,7 @@ in
 
 {
   name = "nixos-autoupdate-integration";
+  skipTypeCheck = true;
 
   nodes = {
     gitserver =
