@@ -1,57 +1,18 @@
 { pkgs, lib, ... }:
 
 let
-  flakeTemplate = ''
+  flakeNix = pkgs.writeText "flake.nix" ''
     {
-      inputs.nixpkgs.url = "path:__NIXPKGS_PATH__";
-      outputs = { self, nixpkgs }: let
-        system = "x86_64-linux";
-      in {
-        nixosConfigurations.autoupdate = nixpkgs.lib.nixosSystem {
-          inherit system;
-          modules = [
-            "''${nixpkgs}/nixos/modules/virtualisation/qemu-vm.nix"
-            ./default.nix
-            ({ config, pkgs, ... }: {
-              system.stateVersion = "25.11";
-              boot.loader.grub.enable = false;
-              fileSystems."/".device = "none";
-              networking.hostName = "autoupdate";
-              networking.useDHCP = true;
-              networking.firewall.enable = false;
-              services.openssh.enable = true;
-              services.openssh.settings.PermitRootLogin = "yes";
-              users.users.root.openssh.authorizedKeys.keys = [];
-              environment.etc."selfupdate-version".text = "__VERSION__";
-              nixos-selfupdate = {
-                enable = true;
-                repoUrl = "ssh://git@gitserver/var/lib/git/test-repo.git";
-                branch = "main";
-                flakeOutput = "nixosConfigurations.autoupdate";
-                frequency = "1min";
-                ageKeyPath = "/var/lib/nixos/secrets/age.key";
-                gitSshKey = "/var/lib/nixos/secrets/git-ssh-key.age";
-              };
-            })
-          ];
-        };
-      };
+      outputs = { ... }: {};
     }
   '';
 
-  flakeV1 = pkgs.writeText "flake-v1" (
-    builtins.replaceStrings [ "__NIXPKGS_PATH__" "__VERSION__" ] [ (toString pkgs.path) "1" ]
-      flakeTemplate
-  );
-  flakeV2 = pkgs.writeText "flake-v2" (
-    builtins.replaceStrings [ "__NIXPKGS_PATH__" "__VERSION__" ] [ (toString pkgs.path) "2" ]
-      flakeTemplate
-  );
+  versionV1 = pkgs.writeText "version-v1" "1\n";
+  versionV2 = pkgs.writeText "version-v2" "2\n";
 in
 
 {
   name = "nixos-autoupdate-integration";
-  skipTypeCheck = true;
 
   nodes = {
     gitserver =
@@ -89,10 +50,10 @@ in
           frequency = "1min";
           ageKeyPath = "/var/lib/nixos/secrets/age.key";
           gitSshKey = "/var/lib/nixos/secrets/git-ssh-key.age";
+          rebuildCommand = "cp \"$FLAKE_WORKTREE/version\" /var/lib/selfupdate-version";
         };
 
         environment.systemPackages = with pkgs; [ age ];
-
         system.stateVersion = "25.11";
         boot.loader.grub.enable = false;
         fileSystems."/".device = "none";
@@ -148,52 +109,48 @@ in
       gitserver.succeed("git init --bare /var/lib/git/test-repo.git")
       gitserver.succeed("chown -R git:git /var/lib/git")
 
-      # ---- Push initial flake (v1) + module to git repo ----
-      gitserver.copy_from_host_via_shell("${flakeV1}", "/tmp/flake.nix")
+      # ---- Push v1: flake.nix + default.nix + version ----
+      gitserver.copy_from_host_via_shell("${flakeNix}", "/tmp/flake.nix")
       gitserver.copy_from_host_via_shell("${../default.nix}", "/tmp/module.nix")
+      gitserver.copy_from_host_via_shell("${versionV1}", "/tmp/version")
 
-        gitserver.succeed("""
-          WORKDIR=$(mktemp -d)
-          cd "$WORKDIR"
-          git init
-          git config user.email "test@test.com"
-          git config user.name "Test"
-          cp /tmp/flake.nix flake.nix
-          cp /tmp/module.nix default.nix
-          git add flake.nix default.nix
-          git commit -m "Initial config v1"
-          git remote add origin /var/lib/git/test-repo.git
-          git push origin main
-          rm -rf "$WORKDIR"
-        """)
+      gitserver.succeed(
+          "git config --global --add safe.directory /var/lib/git/test-repo.git"
+      )
+      gitserver.succeed(
+          "d=$(mktemp -d) && cd \"$d\" && git init && git branch -m main "
+          "&& git config user.email test@test.com && git config user.name Test "
+          "&& cp /tmp/flake.nix flake.nix && cp /tmp/module.nix default.nix "
+          "&& cp /tmp/version version && git add flake.nix default.nix version "
+          "&& git commit -m 'Initial config v1' "
+          "&& git remote add origin /var/lib/git/test-repo.git "
+          "&& git push origin main && rm -rf \"$d\""
+      )
 
-        # ---- Trigger selfupdate on autoupdate VM (clone + rebuild to v1) ----
-        autoupdate.succeed("systemctl start nixos-selfupdate.service")
-
-        result = autoupdate.succeed("cat /etc/selfupdate-version").strip()
-        assert result == "1", "Expected version 1, got " + result
-
-        # ---- Push updated flake (v2) to git repo ----
-        gitserver.copy_from_host_via_shell("${flakeV2}", "/tmp/flake-v2.nix")
-
-        gitserver.succeed("""
-          WORKDIR=$(mktemp -d)
-          cd "$WORKDIR"
-          git clone /var/lib/git/test-repo.git clone-dir
-          cd clone-dir
-          git config user.email "test@test.com"
-          git config user.name "Test"
-          cp /tmp/flake-v2.nix flake.nix
-          git add flake.nix
-          git commit -m "Update to v2"
-          git push origin main
-          rm -rf "$WORKDIR"
-        """)
-
-      # ---- Trigger selfupdate again (fetch v2 + rebuild) ----
+      # ---- First service run: clones repo (no rebuild: CURRENT == FETCH_HEAD) ----
       autoupdate.succeed("systemctl start nixos-selfupdate.service")
 
-      result = autoupdate.succeed("cat /etc/selfupdate-version").strip()
+      # ---- Push v2: updated version file ----
+      gitserver.copy_from_host_via_shell("${versionV2}", "/tmp/version2")
+
+      gitserver.succeed("""
+        WORKDIR=$(mktemp -d)
+        cd "$WORKDIR"
+        git clone -b main /var/lib/git/test-repo.git clone-dir
+        cd clone-dir
+        git config user.email "test@test.com"
+        git config user.name "Test"
+        cp /tmp/version2 version
+        git add version
+        git commit -m "Update to v2"
+        git push origin main
+        rm -rf "$WORKDIR"
+      """)
+
+      # ---- Second service run: detects v2, rebuilds (copies version file) ----
+      autoupdate.succeed("systemctl start nixos-selfupdate.service")
+
+      result = autoupdate.succeed("cat /var/lib/selfupdate-version").strip()
       assert result == "2", "Expected version 2, got " + result
     '';
 }

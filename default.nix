@@ -115,6 +115,7 @@ in
           [
             git
             nix
+            nixos-rebuild
             coreutils
             gnugrep
             openssh
@@ -168,7 +169,7 @@ in
             export GIT_SSH_COMMAND="${pkgs.openssh}/bin/ssh -i $SSH_KEY_FILE -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
           ''}
 
-          if [ ! -d "$REPO/.git" ]; then
+          if ! git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
             log "Cloning repository..."
             mkdir -p "$(dirname "$REPO")"
             git clone --bare --branch "$BRANCH" "${cfg.repoUrl}" "$REPO"
@@ -179,7 +180,7 @@ in
           git fetch origin "$BRANCH"
 
           CURRENT=$(git rev-parse HEAD 2>/dev/null || echo "none")
-          REMOTE=$(git rev-parse "origin/$BRANCH" 2>/dev/null || echo "none")
+          REMOTE=$(git rev-parse FETCH_HEAD 2>/dev/null || echo "none")
 
           if [ "$CURRENT" = "$REMOTE" ]; then
             log "No updates available (already at $CURRENT)"
@@ -190,7 +191,7 @@ in
 
           WORK_DIR=$(mktemp -d)
           trap "rm -rf $WORK_DIR" EXIT
-          git worktree add "$WORK_DIR" "$REMOTE" 2>/dev/null || git worktree add "$WORK_DIR" "origin/$BRANCH"
+          git worktree add "$WORK_DIR" FETCH_HEAD
           chmod 755 "$WORK_DIR"
 
           FLAKE_WORKTREE="$WORK_DIR"
