@@ -71,86 +71,87 @@ in
       gitserver.wait_for_unit("multi-user.target")
       autoupdate.wait_for_unit("multi-user.target")
 
-      # ---- Setup autoupdate VM: age keypair ----
-      autoupdate.succeed("mkdir -p /var/lib/nixos/secrets")
-      autoupdate.succeed("chmod 700 /var/lib/nixos/secrets")
-      autoupdate.succeed("age-keygen -o /var/lib/nixos/secrets/age.key 2>&1")
-      autoupdate.succeed("chmod 600 /var/lib/nixos/secrets/age.key")
+      with subtest("Setup autoupdate VM: age keypair"):
+          autoupdate.succeed("mkdir -p /var/lib/nixos/secrets")
+          autoupdate.succeed("chmod 700 /var/lib/nixos/secrets")
+          autoupdate.succeed("age-keygen -o /var/lib/nixos/secrets/age.key 2>&1")
+          autoupdate.succeed("chmod 600 /var/lib/nixos/secrets/age.key")
 
-      pubkey = autoupdate.succeed(
-          "age-keygen -y /var/lib/nixos/secrets/age.key"
-      ).strip()
+          pubkey = autoupdate.succeed(
+              "age-keygen -y /var/lib/nixos/secrets/age.key"
+          ).strip()
 
-      # ---- Setup autoupdate VM: SSH keypair encrypted with age ----
-      autoupdate.succeed(
-          "ssh-keygen -t ed25519 -N \"\" -f /var/lib/nixos/secrets/git-ssh-key"
-      )
-      autoupdate.succeed(
-          'age -e -r "' + pubkey + '" -o /var/lib/nixos/secrets/git-ssh-key.age '
-          "/var/lib/nixos/secrets/git-ssh-key"
-      )
-      autoupdate.succeed("chmod 600 /var/lib/nixos/secrets/git-ssh-key.age")
+      with subtest("Setup autoupdate VM: SSH keypair encrypted with age"):
+          autoupdate.succeed(
+              "ssh-keygen -t ed25519 -N \"\" -f /var/lib/nixos/secrets/git-ssh-key"
+          )
+          autoupdate.succeed(
+              'age -e -r "' + pubkey + '" -o /var/lib/nixos/secrets/git-ssh-key.age '
+              "/var/lib/nixos/secrets/git-ssh-key"
+          )
+          autoupdate.succeed("chmod 600 /var/lib/nixos/secrets/git-ssh-key.age")
 
-      ssh_pubkey = autoupdate.succeed(
-          "cat /var/lib/nixos/secrets/git-ssh-key.pub"
-      ).strip()
+          ssh_pubkey = autoupdate.succeed(
+              "cat /var/lib/nixos/secrets/git-ssh-key.pub"
+          ).strip()
 
-      # ---- Setup gitserver: authorized_keys ----
-      gitserver.succeed("mkdir -p ~git/.ssh")
-      gitserver.succeed(
-          'echo "' + ssh_pubkey + '" >> ~git/.ssh/authorized_keys'
-      )
-      gitserver.succeed("chmod 700 ~git/.ssh")
-      gitserver.succeed("chmod 600 ~git/.ssh/authorized_keys")
-      gitserver.succeed("chown -R git:git ~git")
+      with subtest("Setup gitserver: authorized_keys"):
+          gitserver.succeed("mkdir -p ~git/.ssh")
+          gitserver.succeed(
+              'echo "' + ssh_pubkey + '" >> ~git/.ssh/authorized_keys'
+          )
+          gitserver.succeed("chmod 700 ~git/.ssh")
+          gitserver.succeed("chmod 600 ~git/.ssh/authorized_keys")
+          gitserver.succeed("chown -R git:git ~git")
 
-      # ---- Setup gitserver: bare git repo ----
-      gitserver.succeed("mkdir -p /var/lib/git")
-      gitserver.succeed("git init --bare /var/lib/git/test-repo.git")
-      gitserver.succeed("chown -R git:git /var/lib/git")
+      with subtest("Setup gitserver: bare git repo"):
+          gitserver.succeed("mkdir -p /var/lib/git")
+          gitserver.succeed("git init --bare /var/lib/git/test-repo.git")
+          gitserver.succeed("chown -R git:git /var/lib/git")
 
-      # ---- Push v1: flake.nix + default.nix + version ----
-      gitserver.copy_from_host_via_shell("${flakeNix}", "/tmp/flake.nix")
-      gitserver.copy_from_host_via_shell("${../default.nix}", "/tmp/module.nix")
-      gitserver.copy_from_host_via_shell("${versionV1}", "/tmp/version")
+      with subtest("Push v1 to git repo"):
+          gitserver.copy_from_host_via_shell("${flakeNix}", "/tmp/flake.nix")
+          gitserver.copy_from_host_via_shell("${../default.nix}", "/tmp/module.nix")
+          gitserver.copy_from_host_via_shell("${versionV1}", "/tmp/version")
 
-      gitserver.succeed(
-          "git config --global --add safe.directory /var/lib/git/test-repo.git"
-      )
-      gitserver.succeed(
-          "d=$(mktemp -d) && cd \"$d\" && git init && git branch -m main "
-          "&& git config user.email test@test.com && git config user.name Test "
-          "&& cp /tmp/flake.nix flake.nix && cp /tmp/module.nix default.nix "
-          "&& cp /tmp/version version && git add flake.nix default.nix version "
-          "&& git commit -m 'Initial config v1' "
-          "&& git remote add origin /var/lib/git/test-repo.git "
-          "&& git push origin main && rm -rf \"$d\""
-      )
+          gitserver.succeed(
+              "git config --global --add safe.directory /var/lib/git/test-repo.git"
+          )
+          gitserver.succeed(
+              "d=$(mktemp -d) && cd \"$d\" && git init && git branch -m main "
+              "&& git config user.email test@test.com && git config user.name Test "
+              "&& cp /tmp/flake.nix flake.nix && cp /tmp/module.nix default.nix "
+              "&& cp /tmp/version version && git add flake.nix default.nix version "
+              "&& git commit -m 'Initial config v1' "
+              "&& git remote add origin /var/lib/git/test-repo.git "
+              "&& git push origin main && rm -rf \"$d\""
+          )
 
-      # ---- First service run: clones repo (no rebuild: CURRENT == FETCH_HEAD) ----
-      autoupdate.succeed("systemctl start nixos-selfupdate.service")
+      with subtest("First service run: clone repo (expect no rebuild)"):
+          autoupdate.succeed("systemctl start nixos-selfupdate.service")
 
-      # ---- Push v2: updated version file ----
-      gitserver.copy_from_host_via_shell("${versionV2}", "/tmp/version2")
+      with subtest("Push v2 to git repo"):
+          gitserver.copy_from_host_via_shell("${versionV2}", "/tmp/version2")
 
-      gitserver.succeed("""
-        WORKDIR=$(mktemp -d)
-        cd "$WORKDIR"
-        git clone -b main /var/lib/git/test-repo.git clone-dir
-        cd clone-dir
-        git config user.email "test@test.com"
-        git config user.name "Test"
-        cp /tmp/version2 version
-        git add version
-        git commit -m "Update to v2"
-        git push origin main
-        rm -rf "$WORKDIR"
-      """)
+          gitserver.succeed("""
+            WORKDIR=$(mktemp -d)
+            cd "$WORKDIR"
+            git clone -b main /var/lib/git/test-repo.git clone-dir
+            cd clone-dir
+            git config user.email "test@test.com"
+            git config user.name "Test"
+            cp /tmp/version2 version
+            git add version
+            git commit -m "Update to v2"
+            git push origin main
+            rm -rf "$WORKDIR"
+          """)
 
-      # ---- Second service run: detects v2, rebuilds (copies version file) ----
-      autoupdate.succeed("systemctl start nixos-selfupdate.service")
+      with subtest("Second service run: detect v2, rebuild"):
+          autoupdate.succeed("systemctl start nixos-selfupdate.service")
 
-      result = autoupdate.succeed("cat /var/lib/selfupdate-version").strip()
-      assert result == "2", "Expected version 2, got " + result
+      with subtest("Verify version"):
+          result = autoupdate.succeed("cat /var/lib/selfupdate-version").strip()
+          assert result == "2", f"Expected version 2, got {result}"
     '';
 }

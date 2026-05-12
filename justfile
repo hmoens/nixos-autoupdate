@@ -2,7 +2,9 @@ check:
     nix flake check
 
 test: check
-    nix build ".#checks.x86_64-linux.integration"
+    @echo "Running integration test..."
+    nix build --rebuild -L ".#checks.x86_64-linux.integration"
+    @echo "Integration test: PASSED"
 
 debug:
     nix build ".#checks.x86_64-linux.integration.driverInteractive"
