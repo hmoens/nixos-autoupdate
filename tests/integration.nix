@@ -151,39 +151,43 @@ in
       gitserver.copy_from_host_via_shell("${flakeV1}", "/tmp/flake.nix")
       gitserver.copy_from_host_via_shell("${../default.nix}", "/tmp/module.nix")
 
-      gitserver.succeed("""
-        WORKDIR=$(mktemp -d)
-        cd "$WORKDIR"
-        git init
-        cp /tmp/flake.nix flake.nix
-        cp /tmp/module.nix default.nix
-        git add flake.nix default.nix
-        git commit -m "Initial config v1"
-        git remote add origin /var/lib/git/test-repo.git
-        git push origin main
-        rm -rf "$WORKDIR"
-      """)
+        gitserver.succeed("""
+          WORKDIR=$(mktemp -d)
+          cd "$WORKDIR"
+          git init
+          git config user.email "test@test.com"
+          git config user.name "Test"
+          cp /tmp/flake.nix flake.nix
+          cp /tmp/module.nix default.nix
+          git add flake.nix default.nix
+          git commit -m "Initial config v1"
+          git remote add origin /var/lib/git/test-repo.git
+          git push origin main
+          rm -rf "$WORKDIR"
+        """)
 
-      # ---- Trigger selfupdate on autoupdate VM (clone + rebuild to v1) ----
-      autoupdate.succeed("systemctl start nixos-selfupdate.service")
+        # ---- Trigger selfupdate on autoupdate VM (clone + rebuild to v1) ----
+        autoupdate.succeed("systemctl start nixos-selfupdate.service")
 
-      result = autoupdate.succeed("cat /etc/selfupdate-version").strip()
-      assert result == "1", "Expected version 1, got " + result
+        result = autoupdate.succeed("cat /etc/selfupdate-version").strip()
+        assert result == "1", "Expected version 1, got " + result
 
-      # ---- Push updated flake (v2) to git repo ----
-      gitserver.copy_from_host_via_shell("${flakeV2}", "/tmp/flake-v2.nix")
+        # ---- Push updated flake (v2) to git repo ----
+        gitserver.copy_from_host_via_shell("${flakeV2}", "/tmp/flake-v2.nix")
 
-      gitserver.succeed("""
-        WORKDIR=$(mktemp -d)
-        cd "$WORKDIR"
-        git clone /var/lib/git/test-repo.git clone-dir
-        cd clone-dir
-        cp /tmp/flake-v2.nix flake.nix
-        git add flake.nix
-        git commit -m "Update to v2"
-        git push origin main
-        rm -rf "$WORKDIR"
-      """)
+        gitserver.succeed("""
+          WORKDIR=$(mktemp -d)
+          cd "$WORKDIR"
+          git clone /var/lib/git/test-repo.git clone-dir
+          cd clone-dir
+          git config user.email "test@test.com"
+          git config user.name "Test"
+          cp /tmp/flake-v2.nix flake.nix
+          git add flake.nix
+          git commit -m "Update to v2"
+          git push origin main
+          rm -rf "$WORKDIR"
+        """)
 
       # ---- Trigger selfupdate again (fetch v2 + rebuild) ----
       autoupdate.succeed("systemctl start nixos-selfupdate.service")
