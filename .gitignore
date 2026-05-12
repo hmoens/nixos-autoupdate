@@ -1,0 +1,16 @@
+result
+result-*
+*.drv
+.direnv/
+.envrc
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+age.key
+*.age.key
+secrets/
+private.nix
+*.tmp
+*.bak
