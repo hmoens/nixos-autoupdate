@@ -44,7 +44,7 @@ in
       {
         imports = [ ../default.nix ];
 
-        nixos-selfupdate = {
+        nixos-autoupdate = {
           enable = true;
           repoUrl = "ssh://git@gitserver/var/lib/git/test-repo.git";
           branch = "main";
@@ -138,7 +138,7 @@ in
           )
 
       with subtest("First service run: clone repo"):
-          autoupdate.succeed("systemctl start nixos-selfupdate.service")
+          autoupdate.succeed("systemctl start nixos-autoupdate.service")
 
       with subtest("Push v2 to git repo"):
           gitserver.copy_from_host_via_shell("${versionV2}", "/tmp/version2")
@@ -158,16 +158,16 @@ in
           """)
 
       with subtest("Second service run: rebuild creates reboot sentinel"):
-          autoupdate.succeed("systemctl start nixos-selfupdate.service")
+          autoupdate.succeed("systemctl start nixos-autoupdate.service")
 
       with subtest("Verify reboot sentinel was created"):
           result = autoupdate.succeed(
-              "test -f /run/nixos-selfupdate/reboot-required && echo yes || echo no"
+              "test -f /run/nixos-autoupdate/reboot-required && echo yes || echo no"
           ).strip()
           assert result == "yes", "Reboot sentinel was not created"
 
       with subtest("Reboot service runs reboot script"):
-          autoupdate.succeed("systemctl start nixos-selfupdate-reboot.service")
+          autoupdate.succeed("systemctl start nixos-autoupdate-reboot.service")
 
       with subtest("Verify rebuild happened and reboot script ran"):
           version = autoupdate.succeed("cat /var/lib/selfupdate-version").strip()

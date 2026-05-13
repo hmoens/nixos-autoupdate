@@ -6,7 +6,7 @@
 }:
 
 let
-  cfg = config."nixos-selfupdate";
+  cfg = config."nixos-autoupdate";
   inherit (lib) types;
 
   rebootScriptPart = lib.optionalString (cfg.autoReboot == "script") ''
@@ -23,7 +23,7 @@ in
 
 {
   options = {
-    nixos-selfupdate = {
+    nixos-autoupdate = {
       enable = lib.mkEnableOption "Self-update system that pulls config from git and rebuilds";
 
       repoUrl = lib.mkOption {
@@ -155,17 +155,17 @@ in
     assertions = [
       {
         assertion = cfg.gitSshKey != null -> cfg.ageKeyPath != null;
-        message = "nixos-selfupdate: ageKeyPath must be set when gitSshKey is set";
+        message = "nixos-autoupdate: ageKeyPath must be set when gitSshKey is set";
       }
       {
         assertion = cfg.autoReboot == "script" -> cfg.rebootScript != null;
-        message = "nixos-selfupdate: rebootScript must be set when autoReboot is set to 'script'";
+        message = "nixos-autoupdate: rebootScript must be set when autoReboot is set to 'script'";
       }
     ];
 
     systemd = {
       timers = {
-        nixos-selfupdate = {
+        nixos-autoupdate = {
           wantedBy = [ "multi-user.target" ];
           timerConfig = {
             OnCalendar = "*-*-* *:*/${cfg.frequency}";
@@ -175,7 +175,7 @@ in
         };
       }
       // lib.optionalAttrs (cfg.autoReboot != "never") {
-        nixos-selfupdate-reboot = {
+        nixos-autoupdate-reboot = {
           wantedBy = [ "multi-user.target" ];
           timerConfig = {
             OnCalendar = "*-*-* *:*/${cfg.rebootFrequency}";
@@ -185,7 +185,7 @@ in
       };
 
       services = {
-        nixos-selfupdate = {
+        nixos-autoupdate = {
           description = "Self-update NixOS configuration from git";
           path =
             with pkgs;
@@ -289,7 +289,7 @@ in
 
             log "Update successful!"
 
-            SENTINEL="/run/nixos-selfupdate/reboot-required"
+            SENTINEL="/run/nixos-autoupdate/reboot-required"
             BOOTED=$(readlink /run/booted-system 2>/dev/null || echo "none")
             CURRENT=$(readlink /run/current-system 2>/dev/null || echo "none")
             if [ "$BOOTED" != "$CURRENT" ]; then
@@ -301,19 +301,19 @@ in
         };
       }
       // lib.optionalAttrs (cfg.autoReboot != "never") {
-        nixos-selfupdate-reboot = {
+        nixos-autoupdate-reboot = {
           description = "NixOS self-update: perform pending reboot";
           path = with pkgs; [ coreutils ];
           serviceConfig.Type = "oneshot";
           script = ''
             set -euo pipefail
 
-            SENTINEL="/run/nixos-selfupdate/reboot-required"
+            SENTINEL="/run/nixos-autoupdate/reboot-required"
             if [ ! -f "$SENTINEL" ]; then
               exit 0
             fi
 
-            if systemctl is-active --quiet nixos-selfupdate.service; then
+            if systemctl is-active --quiet nixos-autoupdate.service; then
               exit 0
             fi
 

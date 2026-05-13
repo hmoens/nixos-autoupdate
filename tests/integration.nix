@@ -42,7 +42,7 @@ in
       {
         imports = [ ../default.nix ];
 
-        nixos-selfupdate = {
+        nixos-autoupdate = {
           enable = true;
           repoUrl = "ssh://git@gitserver/var/lib/git/test-repo.git";
           branch = "main";
@@ -128,7 +128,7 @@ in
           )
 
       with subtest("First service run: clone repo (expect no rebuild)"):
-          autoupdate.succeed("systemctl start nixos-selfupdate.service")
+          autoupdate.succeed("systemctl start nixos-autoupdate.service")
 
       with subtest("Push v2 to git repo"):
           gitserver.copy_from_host_via_shell("${versionV2}", "/tmp/version2")
@@ -148,7 +148,7 @@ in
           """)
 
       with subtest("Second service run: detect v2, rebuild"):
-          autoupdate.succeed("systemctl start nixos-selfupdate.service")
+          autoupdate.succeed("systemctl start nixos-autoupdate.service")
 
       with subtest("Verify version"):
           result = autoupdate.succeed("cat /var/lib/selfupdate-version").strip()
