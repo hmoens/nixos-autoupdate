@@ -79,6 +79,16 @@ in
         '';
       };
 
+      flakeSubdir = lib.mkOption {
+        type = types.str;
+        default = "";
+        description = ''
+          Subdirectory within the git repo containing the Nix flake to build.
+          Use when your flake is not at the repo root.
+          Example: "hosts/nas" if the flake is at <repo>/hosts/nas/flake.nix.
+        '';
+      };
+
       rebuildCommand = lib.mkOption {
         type = types.str;
         default = "nixos-rebuild switch --flake $FLAKE_REF --fast";
@@ -86,7 +96,8 @@ in
           Command to rebuild the system. Available shell variables:
           - $FLAKE_WORKTREE: path to the checked-out git worktree
           - $FLAKE_TARGET: the flake output target (e.g. "nas")
-          - $FLAKE_REF: "$FLAKE_WORKTREE#$FLAKE_TARGET" (ready to use as --flake arg)
+          - $FLAKE_SUBDIR: the flake subdirectory (e.g. "hosts/nas"), or empty
+          - $FLAKE_REF: "$FLAKE_WORKTREE[/$FLAKE_SUBDIR]#$FLAKE_TARGET" (ready to use as --flake arg)
         '';
         example = ''
           nixos-rebuild switch --flake $FLAKE_REF --fast
@@ -262,7 +273,12 @@ in
 
             FLAKE_WORKTREE="$WORK_DIR"
             FLAKE_TARGET="$(echo "$FLAKE_OUTPUT" | grep -oE '[^.]+$' || echo "$FLAKE_OUTPUT")"
-            FLAKE_REF="$FLAKE_WORKTREE#$FLAKE_TARGET"
+            FLAKE_SUBDIR="${cfg.flakeSubdir}"
+            if [ -n "$FLAKE_SUBDIR" ]; then
+              FLAKE_REF="$FLAKE_WORKTREE/$FLAKE_SUBDIR#$FLAKE_TARGET"
+            else
+              FLAKE_REF="$FLAKE_WORKTREE#$FLAKE_TARGET"
+            fi
 
             log "Building new configuration..."
             if ! eval "${cfg.rebuildCommand}" 2>&1 | tee /tmp/nixos-rebuild.log; then
