@@ -87,6 +87,34 @@ in
         default = false;
         description = "Send notification on failed updates (requires configured notifier)";
       };
+
+      autoReboot = lib.mkOption {
+        type = types.enum [
+          "never"
+          "always"
+          "script"
+        ];
+        default = "never";
+        description = ''
+          Whether to automatically reboot when an update requires it
+          (i.e. /run/booted-system differs from /run/current-system).
+
+          - "never": just log that a reboot is needed
+          - "always": reboot immediately after a successful update
+          - "script": run a custom script to decide when to reboot
+        '';
+      };
+
+      rebootScript = lib.mkOption {
+        type = types.nullOr types.path;
+        default = null;
+        description = ''
+          Path to a script that determines when to reboot. Only used when
+          autoReboot = "script". Called after a successful update that
+          requires a reboot. Exit 0 to approve immediate reboot, non-zero
+          to skip (the next timer tick will retry).
+        '';
+      };
     };
   };
 
@@ -95,6 +123,10 @@ in
       {
         assertion = cfg.gitSshKey != null -> cfg.ageKeyPath != null;
         message = "nixos-selfupdate: ageKeyPath must be set when gitSshKey is set";
+      }
+      {
+        assertion = cfg.autoReboot == "script" -> cfg.rebootScript != null;
+        message = "nixos-selfupdate: rebootScript must be set when autoReboot is set to 'script'";
       }
     ];
 
@@ -199,13 +231,38 @@ in
           FLAKE_REF="$FLAKE_WORKTREE#$FLAKE_TARGET"
 
           log "Building new configuration..."
-          if ! ${cfg.rebuildCommand} 2>&1 | tee /tmp/nixos-rebuild.log; then
+          if ! eval "${cfg.rebuildCommand}" 2>&1 | tee /tmp/nixos-rebuild.log; then
             error "Rebuild failed. Log:"
             cat /tmp/nixos-rebuild.log >&2
             exit 1
           fi
 
           log "Update successful!"
+
+          BOOTED=$(readlink /run/booted-system 2>/dev/null || echo "none")
+          CURRENT=$(readlink /run/current-system 2>/dev/null || echo "none")
+          if [ "$BOOTED" != "$CURRENT" ]; then
+            log "Reboot needed: booted-system ($BOOTED) differs from current-system ($CURRENT)"
+            case "${cfg.autoReboot}" in
+              always)
+                log "autoReboot=always: rebooting now..."
+                systemctl reboot
+                ;;
+              ${lib.optionalString (cfg.autoReboot == "script") ''
+                script)
+                  if ${cfg.rebootScript}; then
+                    log "Reboot script approved: rebooting now..."
+                    systemctl reboot
+                  else
+                    log "Reboot script did not approve, skipping"
+                  fi
+                  ;;
+              ''}
+              never)
+                log "Reboot needed (manual)"
+                ;;
+            esac
+          fi
         '';
       };
     };

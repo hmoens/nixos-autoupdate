@@ -21,6 +21,7 @@
         in
         {
           integration = pkgs.testers.runNixOSTest ./tests/integration.nix;
+          reboot = pkgs.testers.runNixOSTest ./tests/reboot.nix;
         }
       );
     };
