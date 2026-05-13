@@ -45,14 +45,19 @@ A NixOS module that periodically pulls configuration from a git repository and r
 | `notifyOnFailure` | bool             | `false`                                            | Notify on failures (requires notifier)        |
 | `autoReboot`      | enum             | `"never"`                                          | Auto-reboot policy: `"never"`, `"always"`, or `"script"` |
 | `rebootScript`    | nullOr path      | `null`                                             | Custom script for reboot timing (only with `autoReboot = "script"`) |
+| `rebootFrequency` | string           | `"1min"`                                           | How often to check for pending reboot (systemd timer format, only when `autoReboot != "never"`) |
 
 ### autoReboot
 
-After `nixos-rebuild switch`, the module checks if `/run/booted-system` differs from `/run/current-system`. If they differ (e.g. kernel, initrd, or systemd changed), a reboot is needed.
+After `nixos-rebuild switch`, the update service compares `/run/booted-system` and `/run/current-system`. If they differ (e.g. kernel, initrd, or systemd changed), it creates a sentinel at `/run/nixos-selfupdate/reboot-required`.
 
-- `"never"` — log that a reboot is needed, require manual action
-- `"always"` — reboot immediately after a successful update
-- `"script"` — run a custom script to decide when to reboot (exit 0 = reboot now, non-zero = skip)
+A separate reboot service (only created when `autoReboot != "never"`) periodically checks for the sentinel and acts per policy:
+
+- `"never"` — sentinel is still created (for external notification watchers) but no reboot service runs. Manual reboot clears it (tmpfs).
+- `"always"` — reboot immediately when sentinel is found
+- `"script"` — run a custom script to decide when to reboot (exit 0 = reboot now, non-zero = skip; retried on next timer tick)
+
+The reboot service guards against races by checking `systemctl is-active nixos-selfupdate.service` and skipping if an update is in progress. If the reboot condition clears before execution (e.g. manual reboot happened), it removes the stale sentinel.
 
 ### rebuildCommand
 
@@ -76,12 +81,13 @@ just debug-reboot       # interactive test shell (reboot)
 
 ## How it works
 
-1. A systemd timer periodically triggers the update service
+1. A systemd timer triggers the update service at the configured `frequency`
 2. The service fetches the latest commits from the git repo
 3. If the remote branch has new commits, it checks out a worktree
 4. Runs the rebuild command (default: `nixos-rebuild switch --flake $FLAKE_REF --fast`)
-5. Compares `/run/booted-system` and `/run/current-system` — if different, handles reboot per `autoReboot` setting
+5. After rebuild, compares `/run/booted-system` and `/run/current-system` — if different, creates a sentinel at `/run/nixos-selfupdate/reboot-required`
 6. Cleans up the worktree
+7. A separate reboot service (when `autoReboot != "never"`) checks the sentinel at the configured `rebootFrequency`, handles reboot per policy, and removes stale sentinels
 
 ## SSH Authentication via Age-Encrypted Keys
 

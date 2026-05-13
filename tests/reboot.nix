@@ -157,8 +157,17 @@ in
             rm -rf "$WORKDIR"
           """)
 
-      with subtest("Second service run: rebuild triggers reboot check"):
+      with subtest("Second service run: rebuild creates reboot sentinel"):
           autoupdate.succeed("systemctl start nixos-selfupdate.service")
+
+      with subtest("Verify reboot sentinel was created"):
+          result = autoupdate.succeed(
+              "test -f /run/nixos-selfupdate/reboot-required && echo yes || echo no"
+          ).strip()
+          assert result == "yes", "Reboot sentinel was not created"
+
+      with subtest("Reboot service runs reboot script"):
+          autoupdate.succeed("systemctl start nixos-selfupdate-reboot.service")
 
       with subtest("Verify rebuild happened and reboot script ran"):
           version = autoupdate.succeed("cat /var/lib/selfupdate-version").strip()

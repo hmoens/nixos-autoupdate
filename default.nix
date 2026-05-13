@@ -8,6 +8,17 @@
 let
   cfg = config."nixos-selfupdate";
   inherit (lib) types;
+
+  rebootScriptPart = lib.optionalString (cfg.autoReboot == "script") ''
+    script)
+      if ${cfg.rebootScript}; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Reboot script approved: rebooting now..."
+        systemctl reboot
+      else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Reboot script did not approve"
+      fi
+      ;;
+  '';
 in
 
 {
@@ -110,12 +121,23 @@ in
         default = null;
         description = ''
           Path to a script that determines when to reboot. Only used when
-          autoReboot = "script". Called after a successful update that
-          requires a reboot. Exit 0 to approve immediate reboot, non-zero
+          autoReboot = "script". Called by the reboot service when a
+          reboot is pending. Exit 0 to approve immediate reboot, non-zero
           to skip (the next timer tick will retry).
         '';
       };
+
+      rebootFrequency = lib.mkOption {
+        type = types.str;
+        default = "1min";
+        description = ''
+          How often to check if a pending reboot should be performed
+          (systemd OnCalendar format). Only applies when autoReboot is
+          not "never".
+        '';
+      };
     };
+
   };
 
   config = lib.mkIf cfg.enable {
@@ -131,139 +153,170 @@ in
     ];
 
     systemd = {
-      timers.nixos-selfupdate = {
-        wantedBy = [ "multi-user.target" ];
-        timerConfig = {
-          OnCalendar = "*-*-* *:*/${cfg.frequency}";
-          Persistent = true;
-          RandomizedDelaySec = "60sec";
+      timers = {
+        nixos-selfupdate = {
+          wantedBy = [ "multi-user.target" ];
+          timerConfig = {
+            OnCalendar = "*-*-* *:*/${cfg.frequency}";
+            Persistent = true;
+            RandomizedDelaySec = "60sec";
+          };
+        };
+      }
+      // lib.optionalAttrs (cfg.autoReboot != "never") {
+        nixos-selfupdate-reboot = {
+          wantedBy = [ "multi-user.target" ];
+          timerConfig = {
+            OnCalendar = "*-*-* *:*/${cfg.rebootFrequency}";
+            Persistent = true;
+          };
         };
       };
 
-      services.nixos-selfupdate = {
-        description = "Self-update NixOS configuration from git";
-        path =
-          with pkgs;
-          [
-            git
-            nix
-            nixos-rebuild
-            coreutils
-            gnugrep
-            openssh
-            gnused
-          ]
-          ++ lib.optionals (cfg.ageKeyPath != null) [ age ];
+      services = {
+        nixos-selfupdate = {
+          description = "Self-update NixOS configuration from git";
+          path =
+            with pkgs;
+            [
+              git
+              nix
+              nixos-rebuild
+              coreutils
+              gnugrep
+              openssh
+              gnused
+            ]
+            ++ lib.optionals (cfg.ageKeyPath != null) [ age ];
 
-        environment = {
-          HOME = "/root";
-          GIT_TERMINAL_PROMPT = "0";
-        };
+          environment = {
+            HOME = "/root";
+            GIT_TERMINAL_PROMPT = "0";
+          };
 
-        serviceConfig = {
-          Type = "oneshot";
-          ProtectSystem = "full";
-          PrivateTmp = true;
-          NoNewPrivileges = false;
-        };
+          serviceConfig = {
+            Type = "oneshot";
+            ProtectSystem = "full";
+            PrivateTmp = true;
+            NoNewPrivileges = false;
+          };
 
-        script = ''
-          set -euo pipefail
+          script = ''
+            set -euo pipefail
 
-          REPO="${cfg.repoPath}"
-          FLAKE_OUTPUT="${cfg.flakeOutput}"
-          BRANCH="${cfg.branch}"
+            REPO="${cfg.repoPath}"
+            FLAKE_OUTPUT="${cfg.flakeOutput}"
+            BRANCH="${cfg.branch}"
 
-          log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
-          error() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $*" >&2; }
+            log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+            error() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $*" >&2; }
 
-          ${lib.optionalString (cfg.ageKeyPath != null) ''
-            if [ ! -f "${cfg.ageKeyPath}" ]; then
-              error "Age key not found at ${cfg.ageKeyPath}"
+            ${lib.optionalString (cfg.ageKeyPath != null) ''
+              if [ ! -f "${cfg.ageKeyPath}" ]; then
+                error "Age key not found at ${cfg.ageKeyPath}"
+                exit 1
+              fi
+              export SOPS_AGE_KEY_FILE="${cfg.ageKeyPath}"
+            ''}
+
+            ${lib.optionalString (cfg.gitSshKey != null) ''
+              if [ ! -f "${cfg.gitSshKey}" ]; then
+                error "Encrypted SSH key not found at ${cfg.gitSshKey}"
+                exit 1
+              fi
+              SSH_KEY_FILE=$(mktemp)
+              trap "rm -f $SSH_KEY_FILE" EXIT
+              age -d -i "${cfg.ageKeyPath}" -o "$SSH_KEY_FILE" "${cfg.gitSshKey}" 2>/dev/null || {
+                error "Failed to decrypt SSH key"
+                rm -f "$SSH_KEY_FILE"
+                exit 1
+              }
+              chmod 600 "$SSH_KEY_FILE"
+              export GIT_SSH_COMMAND="${pkgs.openssh}/bin/ssh -i $SSH_KEY_FILE -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+            ''}
+
+            if ! git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+              log "Cloning repository..."
+              mkdir -p "$(dirname "$REPO")"
+              git clone --bare --branch "$BRANCH" "${cfg.repoUrl}" "$REPO"
+            fi
+
+            log "Checking for updates..."
+            cd "$REPO"
+            git fetch origin "$BRANCH"
+
+            CURRENT=$(git rev-parse HEAD 2>/dev/null || echo "none")
+            REMOTE=$(git rev-parse FETCH_HEAD 2>/dev/null || echo "none")
+
+            if [ "$CURRENT" = "$REMOTE" ]; then
+              log "No updates available (already at $CURRENT)"
+              exit 0
+            fi
+
+            log "Update found: $CURRENT -> $REMOTE"
+
+            WORK_DIR=$(mktemp -d)
+            trap "rm -rf $WORK_DIR" EXIT
+            git worktree add "$WORK_DIR" FETCH_HEAD
+            chmod 755 "$WORK_DIR"
+
+            FLAKE_WORKTREE="$WORK_DIR"
+            FLAKE_TARGET="$(echo "$FLAKE_OUTPUT" | grep -oE '[^.]+$' || echo "$FLAKE_OUTPUT")"
+            FLAKE_REF="$FLAKE_WORKTREE#$FLAKE_TARGET"
+
+            log "Building new configuration..."
+            if ! eval "${cfg.rebuildCommand}" 2>&1 | tee /tmp/nixos-rebuild.log; then
+              error "Rebuild failed. Log:"
+              cat /tmp/nixos-rebuild.log >&2
               exit 1
             fi
-            export SOPS_AGE_KEY_FILE="${cfg.ageKeyPath}"
-          ''}
 
-          ${lib.optionalString (cfg.gitSshKey != null) ''
-            if [ ! -f "${cfg.gitSshKey}" ]; then
-              error "Encrypted SSH key not found at ${cfg.gitSshKey}"
-              exit 1
+            log "Update successful!"
+
+            SENTINEL="/run/nixos-selfupdate/reboot-required"
+            BOOTED=$(readlink /run/booted-system 2>/dev/null || echo "none")
+            CURRENT=$(readlink /run/current-system 2>/dev/null || echo "none")
+            if [ "$BOOTED" != "$CURRENT" ]; then
+              mkdir -p "$(dirname "$SENTINEL")"
+              touch "$SENTINEL"
+              log "Reboot required: sentinel created"
             fi
-            SSH_KEY_FILE=$(mktemp)
-            trap "rm -f $SSH_KEY_FILE" EXIT
-            age -d -i "${cfg.ageKeyPath}" -o "$SSH_KEY_FILE" "${cfg.gitSshKey}" 2>/dev/null || {
-              error "Failed to decrypt SSH key"
-              rm -f "$SSH_KEY_FILE"
-              exit 1
-            }
-            chmod 600 "$SSH_KEY_FILE"
-            export GIT_SSH_COMMAND="${pkgs.openssh}/bin/ssh -i $SSH_KEY_FILE -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
-          ''}
+          '';
+        };
+      }
+      // lib.optionalAttrs (cfg.autoReboot != "never") {
+        nixos-selfupdate-reboot = {
+          description = "NixOS self-update: perform pending reboot";
+          path = with pkgs; [ coreutils ];
+          serviceConfig.Type = "oneshot";
+          script = ''
+            set -euo pipefail
 
-          if ! git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
-            log "Cloning repository..."
-            mkdir -p "$(dirname "$REPO")"
-            git clone --bare --branch "$BRANCH" "${cfg.repoUrl}" "$REPO"
-          fi
+            SENTINEL="/run/nixos-selfupdate/reboot-required"
+            if [ ! -f "$SENTINEL" ]; then
+              exit 0
+            fi
 
-          log "Checking for updates..."
-          cd "$REPO"
-          git fetch origin "$BRANCH"
+            if systemctl is-active --quiet nixos-selfupdate.service; then
+              exit 0
+            fi
 
-          CURRENT=$(git rev-parse HEAD 2>/dev/null || echo "none")
-          REMOTE=$(git rev-parse FETCH_HEAD 2>/dev/null || echo "none")
+            BOOTED=$(readlink /run/booted-system 2>/dev/null || echo "none")
+            CURRENT=$(readlink /run/current-system 2>/dev/null || echo "none")
+            if [ "$BOOTED" = "$CURRENT" ]; then
+              rm -f "$SENTINEL"
+              exit 0
+            fi
 
-          if [ "$CURRENT" = "$REMOTE" ]; then
-            log "No updates available (already at $CURRENT)"
-            exit 0
-          fi
-
-          log "Update found: $CURRENT -> $REMOTE"
-
-          WORK_DIR=$(mktemp -d)
-          trap "rm -rf $WORK_DIR" EXIT
-          git worktree add "$WORK_DIR" FETCH_HEAD
-          chmod 755 "$WORK_DIR"
-
-          FLAKE_WORKTREE="$WORK_DIR"
-          FLAKE_TARGET="$(echo "$FLAKE_OUTPUT" | grep -oE '[^.]+$' || echo "$FLAKE_OUTPUT")"
-          FLAKE_REF="$FLAKE_WORKTREE#$FLAKE_TARGET"
-
-          log "Building new configuration..."
-          if ! eval "${cfg.rebuildCommand}" 2>&1 | tee /tmp/nixos-rebuild.log; then
-            error "Rebuild failed. Log:"
-            cat /tmp/nixos-rebuild.log >&2
-            exit 1
-          fi
-
-          log "Update successful!"
-
-          BOOTED=$(readlink /run/booted-system 2>/dev/null || echo "none")
-          CURRENT=$(readlink /run/current-system 2>/dev/null || echo "none")
-          if [ "$BOOTED" != "$CURRENT" ]; then
-            log "Reboot needed: booted-system ($BOOTED) differs from current-system ($CURRENT)"
             case "${cfg.autoReboot}" in
               always)
-                log "autoReboot=always: rebooting now..."
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] autoReboot=always: rebooting now..."
                 systemctl reboot
                 ;;
-              ${lib.optionalString (cfg.autoReboot == "script") ''
-                script)
-                  if ${cfg.rebootScript}; then
-                    log "Reboot script approved: rebooting now..."
-                    systemctl reboot
-                  else
-                    log "Reboot script did not approve, skipping"
-                  fi
-                  ;;
-              ''}
-              never)
-                log "Reboot needed (manual)"
-                ;;
+              ${rebootScriptPart}
             esac
-          fi
-        '';
+          '';
+        };
       };
     };
 
