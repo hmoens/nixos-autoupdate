@@ -256,15 +256,15 @@ in
             cd "$REPO"
             git fetch origin "$BRANCH"
 
-            CURRENT=$(git rev-parse HEAD 2>/dev/null || echo "none")
+            LAST_APPLIED=$(cat /var/lib/nixos-mgmt/last-applied-commit 2>/dev/null || echo "none")
             REMOTE=$(git rev-parse FETCH_HEAD 2>/dev/null || echo "none")
 
-            if [ "$CURRENT" = "$REMOTE" ]; then
-              log "No updates available (already at $CURRENT)"
+            if [ "$REMOTE" = "$LAST_APPLIED" ]; then
+              log "No updates available (already applied $REMOTE)"
               exit 0
             fi
 
-            log "Update found: $CURRENT -> $REMOTE"
+            log "Update found: $LAST_APPLIED -> $REMOTE"
 
             WORK_DIR=$(mktemp -d)
             trap "rm -rf $WORK_DIR" EXIT
@@ -287,6 +287,7 @@ in
               exit 1
             fi
 
+            echo "$REMOTE" > /var/lib/nixos-mgmt/last-applied-commit
             log "Update successful!"
 
             SENTINEL="/run/nixos-autoupdate/reboot-required"
