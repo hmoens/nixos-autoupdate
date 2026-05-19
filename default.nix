@@ -168,7 +168,7 @@ in
         nixos-autoupdate = {
           wantedBy = [ "multi-user.target" ];
           timerConfig = {
-            OnCalendar = "*-*-* *:*/${cfg.frequency}";
+            OnUnitActiveSec = cfg.frequency;
             Persistent = true;
             RandomizedDelaySec = "60sec";
           };
@@ -178,7 +178,7 @@ in
         nixos-autoupdate-reboot = {
           wantedBy = [ "multi-user.target" ];
           timerConfig = {
-            OnCalendar = "*-*-* *:*/${cfg.rebootFrequency}";
+            OnUnitActiveSec = cfg.rebootFrequency;
             Persistent = true;
           };
         };
