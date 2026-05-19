@@ -49,7 +49,7 @@ in
           repoUrl = "ssh://git@gitserver/var/lib/git/test-repo.git";
           branch = "main";
           flakeOutput = "nixosConfigurations.autoupdate";
-          frequency = "1min";
+          frequency = "*-*-* *:*:00";
           ageKeyPath = "/var/lib/nixos/secrets/age.key";
           gitSshKey = "/var/lib/nixos/secrets/git-ssh-key.age";
           rebuildCommand = ''

@@ -56,9 +56,9 @@ in
 
       frequency = lib.mkOption {
         type = types.str;
-        default = "10min";
+        default = "*/10 * * * *";
         description = "How often to check for updates (systemd OnCalendar format)";
-        example = "10min";
+        example = "*/10 * * * *";
       };
 
       ageKeyPath = lib.mkOption {
@@ -140,7 +140,7 @@ in
 
       rebootFrequency = lib.mkOption {
         type = types.str;
-        default = "1min";
+        default = "*-*-* *:*:00";
         description = ''
           How often to check if a pending reboot should be performed
           (systemd OnCalendar format). Only applies when autoReboot is
@@ -168,7 +168,7 @@ in
         nixos-autoupdate = {
           wantedBy = [ "multi-user.target" ];
           timerConfig = {
-            OnUnitActiveSec = cfg.frequency;
+            OnCalendar = cfg.frequency;
             Persistent = true;
             RandomizedDelaySec = "60sec";
           };
@@ -178,7 +178,7 @@ in
         nixos-autoupdate-reboot = {
           wantedBy = [ "multi-user.target" ];
           timerConfig = {
-            OnUnitActiveSec = cfg.rebootFrequency;
+            OnCalendar = cfg.rebootFrequency;
             Persistent = true;
           };
         };
