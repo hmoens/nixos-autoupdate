@@ -19,6 +19,15 @@ let
       fi
       ;;
   '';
+  applypath = lib.makeBinPath [
+    pkgs.git
+    pkgs.nix
+    pkgs.nixos-rebuild
+    pkgs.coreutils
+    pkgs.gnugrep
+    pkgs.openssh
+    pkgs.gnused
+  ];
 in
 
 {
@@ -51,7 +60,7 @@ in
       repoPath = lib.mkOption {
         type = types.path;
         default = "/var/lib/nixos-mgmt/repo";
-        description = "Local path where the git repository is stored (bare clone)";
+        description = "Local path where the git repository is stored";
       };
 
       frequency = lib.mkOption {
@@ -163,6 +172,133 @@ in
       }
     ];
 
+    environment.etc."nixos-autoupdate/update-git.sh".source =
+      pkgs.writeShellScript "nixos-autoupdate-update-git.sh" ''
+        set -euo pipefail
+
+        REPO="${cfg.repoPath}"
+        STATE_DIR="/var/lib/nixos-mgmt"
+        LAST_APPLIED_FILE="$STATE_DIR/last-applied-commit"
+        FLAKE_OUTPUT="${cfg.flakeOutput}"
+        BRANCH="${cfg.branch}"
+
+        log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+        error() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $*" >&2; }
+
+        ${lib.optionalString (cfg.ageKeyPath != null) ''
+          if [ ! -f "${cfg.ageKeyPath}" ]; then
+            error "Age key not found at ${cfg.ageKeyPath}"
+            exit 1
+          fi
+          export SOPS_AGE_KEY_FILE="${cfg.ageKeyPath}"
+        ''}
+
+        ${lib.optionalString (cfg.gitSshKey != null) ''
+          if [ ! -f "${cfg.gitSshKey}" ]; then
+            error "Encrypted SSH key not found at ${cfg.gitSshKey}"
+            exit 1
+          fi
+          SSH_KEY_FILE=$(mktemp)
+          trap "rm -f $SSH_KEY_FILE" EXIT
+          age -d -i "${cfg.ageKeyPath}" -o "$SSH_KEY_FILE" "${cfg.gitSshKey}" 2>/dev/null || {
+            error "Failed to decrypt SSH key"
+            rm -f "$SSH_KEY_FILE"
+            exit 1
+          }
+          chmod 600 "$SSH_KEY_FILE"
+          export GIT_SSH_COMMAND="${pkgs.openssh}/bin/ssh -i $SSH_KEY_FILE -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        ''}
+
+        if ! git -C "$REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+          if [ -e "$REPO" ]; then
+            log "Existing repo checkout invalid, removing $REPO"
+            rm -rf "$REPO"
+          fi
+
+          log "Cloning repository..."
+
+          mkdir -p "$(dirname "$REPO")"
+
+          git clone \
+            --branch "$BRANCH" \
+            "${cfg.repoUrl}" \
+            "$REPO"
+        fi
+
+        cd "$REPO"
+
+        log "Fetching latest changes..."
+        git fetch --prune origin "$BRANCH"
+
+        REMOTE=$(git rev-parse "origin/$BRANCH")
+        LOCAL=$(git rev-parse HEAD)
+        LAST_APPLIED=$(cat "$LAST_APPLIED_FILE" 2>/dev/null || echo "none")
+
+        if [ "$REMOTE" = "$LAST_APPLIED" ]; then
+          log "No updates available (already applied $REMOTE)"
+          exit 10
+        fi
+
+        log "Update found:"
+        log "  current checkout: $LOCAL"
+        log "  remote:           $REMOTE"
+        log "  last applied:     $LAST_APPLIED"
+
+        log "Checking out $REMOTE..."
+        git reset --hard "$REMOTE"
+        git clean -fd
+      '';
+
+    environment.etc."nixos-autoupdate/apply-git.sh".source =
+      pkgs.writeShellScript "nixos-autoupdate-apply-git.sh" ''
+        set -euo pipefail
+
+        REPO="${cfg.repoPath}"
+        STATE_DIR="/var/lib/nixos-mgmt"
+        LAST_APPLIED_FILE="$STATE_DIR/last-applied-commit"
+
+        log() {
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+        }
+
+        cd "$REPO"
+
+        REMOTE=$(git rev-parse HEAD)
+
+        FLAKE_TARGET="$(echo "${cfg.flakeOutput}" | grep -oE '[^.]+$' || echo "${cfg.flakeOutput}")"
+
+        FLAKE_WORKTREE="$REPO"
+        FLAKE_SUBDIR="${cfg.flakeSubdir}"
+
+        if [ -n "$FLAKE_SUBDIR" ]; then
+          FLAKE_PATH="$FLAKE_WORKTREE/$FLAKE_SUBDIR"
+        else
+          FLAKE_PATH="$FLAKE_WORKTREE"
+        fi
+
+        FLAKE_REF="$FLAKE_PATH#$FLAKE_TARGET"
+
+        log "Building new configuration..."
+
+        ${cfg.rebuildCommand}
+
+        echo "$REMOTE" > "$LAST_APPLIED_FILE"
+
+        log "Update successful"
+
+        SENTINEL="/run/nixos-autoupdate/reboot-required"
+
+        BOOTED=$(readlink /run/booted-system 2>/dev/null || echo "none")
+        CURRENT=$(readlink /run/current-system 2>/dev/null || echo "none")
+
+        if [ "$BOOTED" != "$CURRENT" ]; then
+          mkdir -p "$(dirname "$SENTINEL")"
+          touch "$SENTINEL"
+
+          log "Reboot required: sentinel created"
+        fi
+      '';
+
     systemd = {
       timers = {
         nixos-autoupdate = {
@@ -210,94 +346,22 @@ in
             ProtectSystem = "full";
             PrivateTmp = true;
             NoNewPrivileges = false;
+            SuccessExitStatus = [ 10 ];
           };
 
           script = ''
             set -euo pipefail
 
-            REPO="${cfg.repoPath}"
-            FLAKE_OUTPUT="${cfg.flakeOutput}"
-            BRANCH="${cfg.branch}"
-
             log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
-            error() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $*" >&2; }
 
-            ${lib.optionalString (cfg.ageKeyPath != null) ''
-              if [ ! -f "${cfg.ageKeyPath}" ]; then
-                error "Age key not found at ${cfg.ageKeyPath}"
-                exit 1
-              fi
-              export SOPS_AGE_KEY_FILE="${cfg.ageKeyPath}"
-            ''}
+            /etc/nixos-autoupdate/update-git.sh
 
-            ${lib.optionalString (cfg.gitSshKey != null) ''
-              if [ ! -f "${cfg.gitSshKey}" ]; then
-                error "Encrypted SSH key not found at ${cfg.gitSshKey}"
-                exit 1
-              fi
-              SSH_KEY_FILE=$(mktemp)
-              trap "rm -f $SSH_KEY_FILE" EXIT
-              age -d -i "${cfg.ageKeyPath}" -o "$SSH_KEY_FILE" "${cfg.gitSshKey}" 2>/dev/null || {
-                error "Failed to decrypt SSH key"
-                rm -f "$SSH_KEY_FILE"
-                exit 1
-              }
-              chmod 600 "$SSH_KEY_FILE"
-              export GIT_SSH_COMMAND="${pkgs.openssh}/bin/ssh -i $SSH_KEY_FILE -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
-            ''}
+            log "Starting detached apply job..."
 
-            if ! git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
-              log "Cloning repository..."
-              mkdir -p "$(dirname "$REPO")"
-              git clone --bare --branch "$BRANCH" "${cfg.repoUrl}" "$REPO"
-            fi
-
-            log "Checking for updates..."
-            cd "$REPO"
-            git fetch origin "$BRANCH"
-
-            LAST_APPLIED=$(cat /var/lib/nixos-mgmt/last-applied-commit 2>/dev/null || echo "none")
-            REMOTE=$(git rev-parse FETCH_HEAD 2>/dev/null || echo "none")
-
-            if [ "$REMOTE" = "$LAST_APPLIED" ]; then
-              log "No updates available (already applied $REMOTE)"
-              exit 0
-            fi
-
-            log "Update found: $LAST_APPLIED -> $REMOTE"
-
-            WORK_DIR=$(mktemp -d)
-            trap "rm -rf $WORK_DIR" EXIT
-            git worktree add "$WORK_DIR" FETCH_HEAD
-            chmod 755 "$WORK_DIR"
-
-            FLAKE_WORKTREE="$WORK_DIR"
-            FLAKE_TARGET="$(echo "$FLAKE_OUTPUT" | grep -oE '[^.]+$' || echo "$FLAKE_OUTPUT")"
-            FLAKE_SUBDIR="${cfg.flakeSubdir}"
-            if [ -n "$FLAKE_SUBDIR" ]; then
-              FLAKE_REF="$FLAKE_WORKTREE/$FLAKE_SUBDIR#$FLAKE_TARGET"
-            else
-              FLAKE_REF="$FLAKE_WORKTREE#$FLAKE_TARGET"
-            fi
-
-            log "Building new configuration..."
-            if ! eval "${cfg.rebuildCommand}" 2>&1 | tee /tmp/nixos-rebuild.log; then
-              error "Rebuild failed. Log:"
-              cat /tmp/nixos-rebuild.log >&2
-              exit 1
-            fi
-
-            echo "$REMOTE" > /var/lib/nixos-mgmt/last-applied-commit
-            log "Update successful!"
-
-            SENTINEL="/run/nixos-autoupdate/reboot-required"
-            BOOTED=$(readlink /run/booted-system 2>/dev/null || echo "none")
-            CURRENT=$(readlink /run/current-system 2>/dev/null || echo "none")
-            if [ "$BOOTED" != "$CURRENT" ]; then
-              mkdir -p "$(dirname "$SENTINEL")"
-              touch "$SENTINEL"
-              log "Reboot required: sentinel created"
-            fi
+            systemd-run \
+              --unit=nixos-autoupdate-apply-$(date +%s) \
+              --property="Environment=PATH=${applypath}:/run/wrappers/bin:/usr/bin:/bin" \
+              /etc/nixos-autoupdate/apply-git.sh
           '';
         };
       }

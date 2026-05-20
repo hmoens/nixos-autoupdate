@@ -151,7 +151,13 @@ in
           autoupdate.succeed("systemctl start nixos-autoupdate.service")
 
       with subtest("Verify version"):
-          result = autoupdate.succeed("cat /var/lib/selfupdate-version").strip()
-          assert result == "2", f"Expected version 2, got {result}"
+          import time
+          result = ""
+          for _ in range(15):
+              result = autoupdate.succeed("cat /var/lib/selfupdate-version").strip()
+              if result == "2":
+                  break
+              time.sleep(1)
+          assert result == "2", "Expected version 2, got {}".format(result)
     '';
 }
