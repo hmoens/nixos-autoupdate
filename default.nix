@@ -65,9 +65,9 @@ in
 
       frequency = lib.mkOption {
         type = types.str;
-        default = "*/10 * * * *";
+        default = "*-*-* *:0/10:00";
         description = "How often to check for updates (systemd OnCalendar format)";
-        example = "*/10 * * * *";
+        example = "*-*-* *:0/10:00";
       };
 
       ageKeyPath = lib.mkOption {
