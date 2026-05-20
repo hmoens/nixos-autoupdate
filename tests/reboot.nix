@@ -170,8 +170,14 @@ in
           autoupdate.succeed("systemctl start nixos-autoupdate-reboot.service")
 
       with subtest("Verify rebuild happened and reboot script ran"):
-          version = autoupdate.succeed("cat /var/lib/selfupdate-version").strip()
-          assert version == "2", f"Expected version 2, got {version}"
+          import time
+          result = ""
+          for _ in range(15):
+              result = autoupdate.succeed("cat /var/lib/selfupdate-version").strip()
+              if result == "2":
+                  break
+              time.sleep(1)
+          assert result == "2", "Expected version 2, got {}".format(result)
 
           sentinel = autoupdate.succeed(
               "test -f ${rebootSentinel} && echo yes || echo no"

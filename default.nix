@@ -267,10 +267,13 @@ in
 
         FLAKE_TARGET="$(echo "${cfg.flakeOutput}" | grep -oE '[^.]+$' || echo "${cfg.flakeOutput}")"
 
-        if [ -n "${cfg.flakeSubdir}" ]; then
-          FLAKE_PATH="$REPO/${cfg.flakeSubdir}"
+        FLAKE_WORKTREE="$REPO"
+        FLAKE_SUBDIR="${cfg.flakeSubdir}"
+
+        if [ -n "$FLAKE_SUBDIR" ]; then
+          FLAKE_PATH="$FLAKE_WORKTREE/$FLAKE_SUBDIR"
         else
-          FLAKE_PATH="$REPO"
+          FLAKE_PATH="$FLAKE_WORKTREE"
         fi
 
         FLAKE_REF="$FLAKE_PATH#$FLAKE_TARGET"
