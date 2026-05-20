@@ -21,8 +21,11 @@ let
   '';
   updateGitScript = pkgs.writeShellApplication {
     name = "nixos-autoupdate-update-git.sh";
-    runtimeInputs = [ pkgs.git pkgs.coreutils ]
-      ++ lib.optionals (cfg.ageKeyPath != null) [ pkgs.age ];
+    runtimeInputs = [
+      pkgs.git
+      pkgs.coreutils
+    ]
+    ++ lib.optionals (cfg.ageKeyPath != null) [ pkgs.age ];
     text = ''
       set -euo pipefail
 
@@ -77,7 +80,7 @@ let
       cd "$REPO"
 
       log "Fetching latest changes..."
-      git fetch --prune origin "$BRANCH"
+      git fetch --prune origin
 
       REMOTE=$(git rev-parse "origin/$BRANCH")
       LOCAL=$(git rev-parse HEAD)
@@ -101,7 +104,13 @@ let
 
   applyGitScript = pkgs.writeShellApplication {
     name = "nixos-autoupdate-apply-git.sh";
-    runtimeInputs = with pkgs; [ git coreutils gnugrep nix nixos-rebuild ];
+    runtimeInputs = with pkgs; [
+      git
+      coreutils
+      gnugrep
+      nix
+      nixos-rebuild
+    ];
     text = ''
       set -euo pipefail
 
