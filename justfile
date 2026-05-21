@@ -4,7 +4,7 @@ check:
 test: check
     @echo "Running all tests..."
     @failed=""; \
-    for t in integration reboot; do \
+    for t in defaultRebuildCommand integration reboot; do \
         printf "  %-12s " "$t"; \
         if nix build --rebuild --no-link ".#checks.x86_64-linux.$t" > /tmp/nix-test-$t.log 2>&1; then \
             echo "PASSED"; \

@@ -233,7 +233,7 @@ in
 
       rebuildCommand = lib.mkOption {
         type = types.str;
-        default = "nixos-rebuild switch --flake $FLAKE_REF --fast";
+        default = "nixos-rebuild switch --flake \"$FLAKE_REF\" --fast";
         description = ''
           Command to rebuild the system. Available shell variables:
           - $FLAKE_WORKTREE: path to the checked-out git worktree
@@ -242,7 +242,7 @@ in
           - $FLAKE_REF: "$FLAKE_WORKTREE[/$FLAKE_SUBDIR]#$FLAKE_TARGET" (ready to use as --flake arg)
         '';
         example = ''
-          nixos-rebuild switch --flake $FLAKE_REF --fast
+          nixos-rebuild switch --flake "$FLAKE_REF" --fast
         '';
       };
 
