@@ -61,6 +61,13 @@ in
             touch ${rebootSentinel}
             exit 1
           '';
+          onRebootStatus = ''
+            mkdir -p /run/nixos-autoupdate
+            echo "EVENT=$AUTOUPDATE_EVENT" > /run/nixos-autoupdate/on-reboot-status.env
+            echo "STATUS=$AUTOUPDATE_STATUS" >> /run/nixos-autoupdate/on-reboot-status.env
+            echo "REBOOT_REQUIRED=$AUTOUPDATE_REBOOT_REQUIRED" >> /run/nixos-autoupdate/on-reboot-status.env
+            echo "COMMIT=$AUTOUPDATE_CHECKED_OUT_COMMIT" >> /run/nixos-autoupdate/on-reboot-status.env
+          '';
         };
 
         environment.systemPackages = with pkgs; [ age ];
@@ -168,6 +175,12 @@ in
 
       with subtest("Reboot service runs reboot script"):
           autoupdate.succeed("systemctl start nixos-autoupdate-reboot.service")
+
+      with subtest("Verify on-reboot-status (REBOOT_NEEDED)"):
+          result = autoupdate.succeed("cat /run/nixos-autoupdate/on-reboot-status.env")
+          assert "EVENT=REBOOT_NEEDED" in result, "Expected REBOOT_NEEDED: " + result
+          assert "STATUS=REBOOT_NEEDED" in result
+          assert "REBOOT_REQUIRED=true" in result
 
       with subtest("Verify rebuild happened and reboot script ran"):
           import time

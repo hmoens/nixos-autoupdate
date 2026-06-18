@@ -19,6 +19,19 @@ let
       fi
       ;;
   '';
+
+  onGitStatusScript = if cfg.onGitStatus != null then
+    pkgs.writeShellScript "nixos-autoupdate-on-git-status" cfg.onGitStatus
+  else null;
+
+  onApplyStatusScript = if cfg.onApplyStatus != null then
+    pkgs.writeShellScript "nixos-autoupdate-on-apply-status" cfg.onApplyStatus
+  else null;
+
+  onRebootStatusScript = if cfg.onRebootStatus != null then
+    pkgs.writeShellScript "nixos-autoupdate-on-reboot-status" cfg.onRebootStatus
+  else null;
+
   updateGitScript = pkgs.writeShellApplication {
     name = "nixos-autoupdate-update-git.sh";
     runtimeInputs = [
@@ -105,6 +118,7 @@ let
   applyGitScript = pkgs.writeShellApplication {
     name = "nixos-autoupdate-apply-git.sh";
     runtimeInputs = with pkgs; [
+      curl
       git
       coreutils
       gnugrep
@@ -142,23 +156,48 @@ let
 
       log "Building new configuration..."
 
+      set +e
       ${cfg.rebuildCommand}
+      REBUILD_EXIT=$?
+      set -e
 
-      echo "$REMOTE" > "$LAST_APPLIED_FILE"
+      if [ "$REBUILD_EXIT" -eq 0 ]; then
+        echo "$REMOTE" > "$LAST_APPLIED_FILE"
 
-      log "Update successful"
+        log "Update successful"
 
-      SENTINEL="/run/nixos-autoupdate/reboot-required"
+        SENTINEL="/run/nixos-autoupdate/reboot-required"
 
-      BOOTED=$(readlink /run/booted-system 2>/dev/null || echo "none")
-      CURRENT=$(readlink /run/current-system 2>/dev/null || echo "none")
+        BOOTED=$(readlink /run/booted-system 2>/dev/null || echo "none")
+        CURRENT=$(readlink /run/current-system 2>/dev/null || echo "none")
 
-      if [ "$BOOTED" != "$CURRENT" ]; then
-        mkdir -p "$(dirname "$SENTINEL")"
-        touch "$SENTINEL"
+        if [ "$BOOTED" != "$CURRENT" ]; then
+          mkdir -p "$(dirname "$SENTINEL")"
+          touch "$SENTINEL"
 
-        log "Reboot required: sentinel created"
+          log "Reboot required: sentinel created"
+        fi
+
+        AUTOUPDATE_EVENT=SUCCESS
+        AUTOUPDATE_STATUS=OK
+        AUTOUPDATE_MESSAGE="Update applied successfully"
+      else
+        AUTOUPDATE_EVENT=APPLY_FAILED
+        AUTOUPDATE_STATUS=NIX_ERROR
+        AUTOUPDATE_MESSAGE="NixOS rebuild failed (exit $REBUILD_EXIT)"
       fi
+
+      AUTOUPDATE_HOSTNAME="${config.networking.hostName}"
+      AUTOUPDATE_HOST_IP="$(ip -4 -o addr show scope global | head -1 | awk '{print $4}' | cut -d/ -f1 || echo 'unknown')"
+      AUTOUPDATE_CHECKED_OUT_COMMIT="$REMOTE"
+      AUTOUPDATE_REBOOT_REQUIRED="$([ -f /run/nixos-autoupdate/reboot-required ] && echo true || echo false)"
+      export AUTOUPDATE_EVENT AUTOUPDATE_STATUS AUTOUPDATE_HOSTNAME AUTOUPDATE_HOST_IP AUTOUPDATE_CHECKED_OUT_COMMIT AUTOUPDATE_REBOOT_REQUIRED AUTOUPDATE_MESSAGE
+
+      ${lib.optionalString (cfg.onApplyStatus != null) ''
+        ${onApplyStatusScript} || true
+      ''}
+
+      exit $REBUILD_EXIT
     '';
   };
 in
@@ -289,6 +328,39 @@ in
           not "never".
         '';
       };
+
+      onGitStatus = lib.mkOption {
+        type = types.nullOr types.lines;
+        default = null;
+        description = ''
+          Shell script to run after each git checkout cycle. Called with
+          AUTOUPDATE_* environment variables: EVENT, STATUS, HOSTNAME,
+          HOST_IP, CHECKED_OUT_COMMIT, MESSAGE.
+          Exit mapping: 0=UPDATE_FOUND, 10=NOOP, other=UPDATE_FAILED.
+        '';
+      };
+
+      onApplyStatus = lib.mkOption {
+        type = types.nullOr types.lines;
+        default = null;
+        description = ''
+          Shell script to run after each nixos-rebuild attempt. Called with
+          AUTOUPDATE_* environment variables: EVENT, STATUS, HOSTNAME,
+          HOST_IP, CHECKED_OUT_COMMIT, REBOOT_REQUIRED, MESSAGE.
+          Exit mapping: 0=SUCCESS, non-zero=APPLY_FAILED.
+        '';
+      };
+
+      onRebootStatus = lib.mkOption {
+        type = types.nullOr types.lines;
+        default = null;
+        description = ''
+          Shell script to run on each reboot check cycle. Called with
+          AUTOUPDATE_* environment variables: EVENT, STATUS, HOSTNAME,
+          HOST_IP, CHECKED_OUT_COMMIT, REBOOT_REQUIRED, MESSAGE.
+          Sentinel present=REBOOT_NEEDED, absent=NO_REBOOT_NEEDED.
+        '';
+      };
     };
 
   };
@@ -322,7 +394,7 @@ in
           };
         };
       }
-      // lib.optionalAttrs (cfg.autoReboot != "never") {
+      // lib.optionalAttrs (cfg.autoReboot != "never" || cfg.onRebootStatus != null) {
         nixos-autoupdate-reboot = {
           wantedBy = [ "multi-user.target" ];
           timerConfig = {
@@ -338,6 +410,7 @@ in
           path =
             with pkgs;
             [
+              curl
               git
               nix
               nixos-rebuild
@@ -366,25 +439,83 @@ in
 
             log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
+            set +e
             /etc/nixos-autoupdate/update-git.sh
+            UPDATE_EXIT=$?
+            set -e
 
-            log "Starting detached apply job..."
+            case $UPDATE_EXIT in
+              0)
+                AUTOUPDATE_EVENT=UPDATE_FOUND
+                AUTOUPDATE_STATUS=OK
+                AUTOUPDATE_MESSAGE="Update found: new commits available"
+                ;;
+              10)
+                AUTOUPDATE_EVENT=NOOP
+                AUTOUPDATE_STATUS=OK
+                AUTOUPDATE_MESSAGE="No updates available (already applied)"
+                ;;
+              *)
+                AUTOUPDATE_EVENT=UPDATE_FAILED
+                AUTOUPDATE_STATUS=GIT_ERROR
+                AUTOUPDATE_MESSAGE="Git checkout failed (exit $UPDATE_EXIT)"
+                ;;
+            esac
 
-            systemd-run \
-              --unit=nixos-autoupdate-apply-$(date +%s) \
-              /etc/nixos-autoupdate/apply-git.sh
+            AUTOUPDATE_HOSTNAME="${config.networking.hostName}"
+            AUTOUPDATE_HOST_IP="$(ip -4 -o addr show scope global | head -1 | awk '{print $4}' | cut -d/ -f1 || echo 'unknown')"
+            AUTOUPDATE_CHECKED_OUT_COMMIT="$(git -C ${cfg.repoPath} rev-parse HEAD 2>/dev/null || echo 'unknown')"
+            export AUTOUPDATE_EVENT AUTOUPDATE_STATUS AUTOUPDATE_HOSTNAME AUTOUPDATE_HOST_IP AUTOUPDATE_CHECKED_OUT_COMMIT AUTOUPDATE_MESSAGE
+
+            ${lib.optionalString (cfg.onGitStatus != null) ''
+              ${onGitStatusScript} || true
+            ''}
+
+            if [ "$UPDATE_EXIT" -eq 0 ] || [ "$UPDATE_EXIT" -eq 10 ]; then
+              log "Starting detached apply job..."
+
+              systemd-run \
+                --unit=nixos-autoupdate-apply-$(date +%s) \
+                /etc/nixos-autoupdate/apply-git.sh
+            else
+              log "Git update failed: skipping apply"
+            fi
+
+            exit $UPDATE_EXIT
           '';
         };
       }
-      // lib.optionalAttrs (cfg.autoReboot != "never") {
+      // lib.optionalAttrs (cfg.autoReboot != "never" || cfg.onRebootStatus != null) {
         nixos-autoupdate-reboot = {
           description = "NixOS self-update: perform pending reboot";
-          path = with pkgs; [ coreutils ];
+          path = with pkgs; [ coreutils git curl ];
           serviceConfig.Type = "oneshot";
           script = ''
             set -euo pipefail
 
             SENTINEL="/run/nixos-autoupdate/reboot-required"
+
+            if [ -f "$SENTINEL" ]; then
+              AUTOUPDATE_EVENT=REBOOT_NEEDED
+              AUTOUPDATE_STATUS=REBOOT_NEEDED
+              AUTOUPDATE_REBOOT_REQUIRED=true
+              AUTOUPDATE_MESSAGE="Reboot is pending"
+            else
+              AUTOUPDATE_EVENT=NO_REBOOT_NEEDED
+              AUTOUPDATE_STATUS=OK
+              AUTOUPDATE_REBOOT_REQUIRED=false
+              AUTOUPDATE_MESSAGE="No reboot needed"
+            fi
+
+            AUTOUPDATE_HOSTNAME="${config.networking.hostName}"
+            AUTOUPDATE_HOST_IP="$(ip -4 -o addr show scope global | head -1 | awk '{print $4}' | cut -d/ -f1 || echo 'unknown')"
+            AUTOUPDATE_CHECKED_OUT_COMMIT="$(git -C ${cfg.repoPath} rev-parse HEAD 2>/dev/null || echo 'unknown')"
+            export AUTOUPDATE_EVENT AUTOUPDATE_STATUS AUTOUPDATE_HOSTNAME AUTOUPDATE_HOST_IP AUTOUPDATE_CHECKED_OUT_COMMIT AUTOUPDATE_REBOOT_REQUIRED AUTOUPDATE_MESSAGE
+
+            ${lib.optionalString (cfg.onRebootStatus != null) ''
+              ${onRebootStatusScript} || true
+            ''}
+
             if [ ! -f "$SENTINEL" ]; then
               exit 0
             fi
