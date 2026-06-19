@@ -42,10 +42,66 @@ A NixOS module that periodically pulls configuration from a git repository and r
 | `ageKeyPath`      | nullOr path      | `null`                                             | Age private key path (for agenix + gitSshKey) |
 | `gitSshKey`       | nullOr path      | `null`                                             | Age-encrypted SSH key for git auth            |
 | `rebuildCommand`  | string           | `"nixos-rebuild switch --flake $FLAKE_REF --fast"` | Command to rebuild the system                 |
+| `onGitStatus`     | nullOr lines     | `null`                                             | Script run after git fetch with `AUTOUPDATE_EVENT`/`AUTOUPDATE_STATUS` etc. |
+| `onApplyStatus`   | nullOr lines     | `null`                                             | Script run after rebuild with `AUTOUPDATE_EVENT`/`AUTOUPDATE_STATUS` etc. |
+| `onRebootStatus`  | nullOr lines     | `null`                                             | Script run on each reboot timer tick with `AUTOUPDATE_EVENT`/`AUTOUPDATE_STATUS` etc. |
 | `notifyOnFailure` | bool             | `false`                                            | Notify on failures (requires notifier)        |
 | `autoReboot`      | enum             | `"never"`                                          | Auto-reboot policy: `"never"`, `"always"`, or `"script"` |
 | `rebootScript`    | nullOr path      | `null`                                             | Custom script for reboot timing (only with `autoReboot = "script"`) |
 | `rebootFrequency` | string           | `"1min"`                                           | How often to check for pending reboot (systemd timer format, only when `autoReboot != "never"`) |
+
+### Status Hooks
+
+Each hook fires independently at a different stage of the update cycle and receives context via environment variables. All scripts must be POSIX `sh` compatible.
+
+| Option             | Fires when                                      | Key env vars                                                                 |
+| ------------------ | ----------------------------------------------- | ---------------------------------------------------------------------------- |
+| `onGitStatus`      | After git fetch, before rebuild                 | `AUTOUPDATE_EVENT` `AUTOUPDATE_STATUS` `AUTOUPDATE_CHECKED_OUT_COMMIT`       |
+| `onApplyStatus`    | After `nixos-rebuild switch` completes          | `AUTOUPDATE_EVENT` `AUTOUPDATE_STATUS` `AUTOUPDATE_CHECKED_OUT_COMMIT` `AUTOUPDATE_REBOOT_REQUIRED` |
+| `onRebootStatus`   | On every reboot timer tick (regardless of sentinel) | `AUTOUPDATE_EVENT` `AUTOUPDATE_STATUS` `AUTOUPDATE_REBOOT_REQUIRED` |
+
+**Common env vars available in all hooks:**
+
+| Variable                     | Description                                      |
+| ---------------------------- | ------------------------------------------------ |
+| `AUTOUPDATE_HOSTNAME`        | NixOS `networking.hostName`                      |
+| `AUTOUPDATE_HOST_IP`         | IPv4 address of `AUTOUPDATE_HOSTNAME` (`hostname -I`) |
+| `AUTOUPDATE_EVENT`           | Machine-readable event code                      |
+| `AUTOUPDATE_STATUS`          | Machine-readable status code                     |
+| `AUTOUPDATE_CHECKED_OUT_COMMIT` | Git HEAD commit at time of event (SHA)         |
+| `AUTOUPDATE_REBOOT_REQUIRED` | `"true"` or `"false"` (only in `onApplyStatus` and `onRebootStatus`) |
+
+**Event/status values:**
+
+| AUTOUPDATE_EVENT    | Meaning                                            |
+| ------------------- | -------------------------------------------------- |
+| `NOOP`              | No new commits (exit 10 from `update-git.sh`)      |
+| `UPDATE_FOUND`      | New commits checked out, about to rebuild          |
+| `UPDATE_FAILED`     | Git fetch or checkout failed                       |
+| `SUCCESS`           | `nixos-rebuild switch` succeeded                   |
+| `APPLY_FAILED`      | `nixos-rebuild switch` failed                      |
+| `REBOOT_NEEDED`     | Reboot sentinel present on timer tick              |
+| `NO_REBOOT_NEEDED`  | No reboot sentinel on timer tick                   |
+
+| AUTOUPDATE_STATUS   | Meaning                                            |
+| ------------------- | -------------------------------------------------- |
+| `OK`                | Everything nominal                                  |
+| `GIT_ERROR`         | Git operation failed                                |
+| `NIX_ERROR`         | Rebuild failed                                      |
+| `REBOOT_NEEDED`     | Reboot required (mirrors event)                     |
+
+**Typical usage — push metrics to a Pushgateway:**
+
+```nix
+nixos-autoupdate.onApplyStatus = ''
+  curl -s -o /dev/null http://127.0.0.1:9091/metrics/job/autoupdate/instance/$AUTOUPDATE_HOSTNAME \
+    --data-binary @- <<EOF
+  # HELP autoupdate_nix_status NixOS rebuild status
+  # TYPE autoupdate_nix_status gauge
+  autoupdate_nix_status{host="$AUTOUPDATE_HOSTNAME",status="$AUTOUPDATE_STATUS",event="$AUTOUPDATE_EVENT",reboot_required="$AUTOUPDATE_REBOOT_REQUIRED"} 1
+  EOF
+'';
+```
 
 ### autoReboot
 
@@ -83,11 +139,13 @@ just debug-reboot       # interactive test shell (reboot)
 
 1. A systemd timer triggers the update service at the configured `frequency`
 2. The service fetches the latest commits from the git repo
-3. If the remote branch has new commits, it checks out a worktree
-4. Runs the rebuild command (default: `nixos-rebuild switch --flake $FLAKE_REF --fast`)
-5. After rebuild, compares `/run/booted-system` and `/run/current-system` — if different, creates a sentinel at `/run/nixos-selfupdate/reboot-required`
-6. Cleans up the worktree
-7. A separate reboot service (when `autoReboot != "never"`) checks the sentinel at the configured `rebootFrequency`, handles reboot per policy, and removes stale sentinels
+3. If `onGitStatus` is set, it is called with the event/status after git fetch
+4. On new commits (or always if `onGitStatus` is set), checks out a worktree
+5. Runs the rebuild command (default: `nixos-rebuild switch --flake $FLAKE_REF --fast`)
+6. If `onApplyStatus` is set, it is called with the rebuild result
+7. After rebuild, compares `/run/booted-system` and `/run/current-system` — if different, creates a sentinel at `/run/nixos-selfupdate/reboot-required`
+8. Cleans up the worktree
+9. A separate reboot timer fires on every tick, calls `onRebootStatus` (if set), and when `autoReboot != "never"` checks the sentinel at the configured `rebootFrequency`, handles reboot per policy, and removes stale sentinels
 
 ## SSH Authentication via Age-Encrypted Keys
 

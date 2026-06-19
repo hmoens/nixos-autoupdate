@@ -51,6 +51,21 @@ in
           ageKeyPath = "/var/lib/nixos/secrets/age.key";
           gitSshKey = "/var/lib/nixos/secrets/git-ssh-key.age";
           rebuildCommand = "cp \"$FLAKE_WORKTREE/version\" /var/lib/selfupdate-version";
+          onGitStatus = ''
+            mkdir -p /run/nixos-autoupdate
+            echo "EVENT=$AUTOUPDATE_EVENT" > /run/nixos-autoupdate/on-git-status.env
+            echo "STATUS=$AUTOUPDATE_STATUS" >> /run/nixos-autoupdate/on-git-status.env
+            echo "HOSTNAME=$AUTOUPDATE_HOSTNAME" >> /run/nixos-autoupdate/on-git-status.env
+            echo "COMMIT=$AUTOUPDATE_CHECKED_OUT_COMMIT" >> /run/nixos-autoupdate/on-git-status.env
+          '';
+          onApplyStatus = ''
+            mkdir -p /run/nixos-autoupdate
+            echo "EVENT=$AUTOUPDATE_EVENT" > /run/nixos-autoupdate/on-apply-status.env
+            echo "STATUS=$AUTOUPDATE_STATUS" >> /run/nixos-autoupdate/on-apply-status.env
+            echo "HOSTNAME=$AUTOUPDATE_HOSTNAME" >> /run/nixos-autoupdate/on-apply-status.env
+            echo "COMMIT=$AUTOUPDATE_CHECKED_OUT_COMMIT" >> /run/nixos-autoupdate/on-apply-status.env
+            echo "REBOOT_REQUIRED=$AUTOUPDATE_REBOOT_REQUIRED" >> /run/nixos-autoupdate/on-apply-status.env
+          '';
         };
 
         environment.systemPackages = with pkgs; [ age ];
@@ -130,6 +145,12 @@ in
       with subtest("First service run: clone repo (expect no rebuild)"):
           autoupdate.succeed("systemctl start nixos-autoupdate.service")
 
+      with subtest("Verify on-git-status (first run: UPDATE_FOUND)"):
+          result = autoupdate.succeed("cat /run/nixos-autoupdate/on-git-status.env")
+          assert "EVENT=UPDATE_FOUND" in result, "Expected UPDATE_FOUND: " + result
+          assert "STATUS=OK" in result
+          assert "HOSTNAME=autoupdate" in result
+
       with subtest("Push v2 to git repo"):
           gitserver.copy_from_host_via_shell("${versionV2}", "/tmp/version2")
 
@@ -150,6 +171,10 @@ in
       with subtest("Second service run: detect v2, rebuild"):
           autoupdate.succeed("systemctl start nixos-autoupdate.service")
 
+      with subtest("Verify on-git-status (second run: UPDATE_FOUND)"):
+          result = autoupdate.succeed("cat /run/nixos-autoupdate/on-git-status.env")
+          assert "EVENT=UPDATE_FOUND" in result, "Expected UPDATE_FOUND: " + result
+
       with subtest("Verify version"):
           import time
           result = ""
@@ -159,5 +184,12 @@ in
                   break
               time.sleep(1)
           assert result == "2", "Expected version 2, got {}".format(result)
+
+      with subtest("Verify on-apply-status (SUCCESS)"):
+          result = autoupdate.succeed("cat /run/nixos-autoupdate/on-apply-status.env")
+          assert "EVENT=SUCCESS" in result, "Expected SUCCESS: " + result
+          assert "STATUS=OK" in result
+          assert "HOSTNAME=autoupdate" in result
+          assert "REBOOT_REQUIRED=false" in result
     '';
 }
