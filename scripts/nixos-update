@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+# nixos-update: manual control and status for the nixos-autoupdate pipeline.
+set -euo pipefail
+
+STATE_DIR="/var/lib/nixos-mgmt"
+RUN_DIR="/run/nixos-autoupdate"
+STATUS_FILE="$STATE_DIR/status.json"
+HOLD_FILE="$STATE_DIR/hold"
+
+UNITS=(
+  nixos-autoupdate-check.service
+  nixos-autoupdate-build.service
+  nixos-autoupdate-activate.service
+  nixos-autoupdate-switch.service
+  nixos-autoupdate-reboot.service
+)
+
+usage() {
+  cat <<'EOF'
+Usage: nixos-update [command]
+
+  status [--json]   Show pipeline state (default command)
+  run [--reboot]    Run check + build + activate now, bypassing gates,
+                    streaming logs; --reboot also reboots if required
+  check             Fetch and detect updates now
+  build             Build the pending config now (bypasses the build gate)
+  activate          Activate the built config now (bypasses the activate gate)
+  reboot            Reboot now if a reboot is pending (bypasses the reboot gate)
+  hold [reason]     Pause build/activate/reboot (check keeps running)
+  unhold            Resume the pipeline
+  log [-f]          Show (or follow) logs across all pipeline units
+EOF
+}
+
+require_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "nixos-update: must be run as root" >&2
+    exit 1
+  fi
+}
+
+ensure_run() { mkdir -p "$RUN_DIR" "$STATE_DIR"; }
+
+phase_running() {
+  local u name
+  for u in "${UNITS[@]}"; do
+    if systemctl is-active --quiet "$u" 2>/dev/null; then
+      name="${u#nixos-autoupdate-}"
+      echo "${name%.service}"
+      return 0
+    fi
+  done
+  echo ""
+}
+
+wait_unit() {
+  # Block until the unit is no longer active (with a safety cap).
+  local u="$1" i=0
+  while systemctl is-active --quiet "$u" 2>/dev/null; do
+    sleep 1
+    i=$((i + 1))
+    [ "$i" -ge 3600 ] && break
+  done
+}
+
+start_phase() {
+  # start_phase <phase> [--block]
+  local phase="$1" block="${2:-}"
+  local unit="nixos-autoupdate-$phase.service"
+  ensure_run
+  touch "$RUN_DIR/force-$phase"
+  systemctl reset-failed "$unit" 2>/dev/null || true
+  if [ "$block" = "--block" ]; then
+    systemctl start "$unit" || true
+  else
+    systemctl start --no-block "$unit" || true
+  fi
+}
+
+cmd_status() {
+  local json=0
+  [ "${1:-}" = "--json" ] && json=1
+
+  if [ ! -f "$STATUS_FILE" ]; then
+    if [ "$json" = 1 ]; then
+      echo '{"phase":"unknown","running":null}'
+    else
+      echo "nixos-autoupdate has not run yet."
+    fi
+    return 0
+  fi
+
+  local running
+  running="$(phase_running)"
+
+  if [ "$json" = 1 ]; then
+    jq --arg r "$running" '. + {running:(if $r=="" then null else $r end)}' "$STATUS_FILE"
+    return 0
+  fi
+
+  local phase hold lc fetched built applied rr err
+  phase="$(jq -r '.phase' "$STATUS_FILE")"
+  hold="$(jq -r '.hold' "$STATUS_FILE")"
+  lc="$(jq -r '.last_check // "never"' "$STATUS_FILE")"
+  fetched="$(jq -r '.fetched_commit // "-"' "$STATUS_FILE")"
+  built="$(jq -r '.built_commit // "-"' "$STATUS_FILE")"
+  applied="$(jq -r '.applied_commit // "-"' "$STATUS_FILE")"
+  rr="$(jq -r '.reboot_required' "$STATUS_FILE")"
+  err="$(jq -r 'if .last_error==null then "-" else "[\(.last_error.phase)] \(.last_error.message)" end' "$STATUS_FILE")"
+
+  echo "nixos-autoupdate"
+  if [ -n "$running" ]; then
+    echo "  phase:            $phase (running: $running)"
+  else
+    echo "  phase:            $phase"
+  fi
+  echo "  hold:             $hold"
+  echo "  last check:       $lc"
+  echo "  fetched commit:   $fetched"
+  echo "  built commit:     $built"
+  echo "  applied commit:   $applied"
+  echo "  reboot required:  $rr"
+  echo "  last error:       $err"
+
+  if [ "$fetched" != "-" ] && [ "$fetched" != "$applied" ]; then
+    echo
+    echo "  update pending (fetched != applied)"
+  fi
+}
+
+cmd_run() {
+  local reboot_after=0
+  [ "${1:-}" = "--reboot" ] && reboot_after=1
+  require_root
+  ensure_run
+
+  journalctl -n 0 -f --no-pager \
+    -u nixos-autoupdate-check.service \
+    -u nixos-autoupdate-build.service \
+    -u nixos-autoupdate-activate.service \
+    -u nixos-autoupdate-switch.service &
+  local jpid=$!
+  # shellcheck disable=SC2064
+  trap "kill $jpid 2>/dev/null || true" EXIT
+
+  echo "==> check"
+  start_phase check --block
+  echo "==> build"
+  start_phase build --block
+  echo "==> activate"
+  start_phase activate --block
+  # activate spawns the transient switch unit; wait for it to finish.
+  sleep 1
+  wait_unit nixos-autoupdate-switch.service
+  sleep 1
+
+  kill "$jpid" 2>/dev/null || true
+  trap - EXIT
+
+  if [ "$reboot_after" = 1 ]; then
+    local rr
+    rr="$(jq -r '.reboot_required' "$STATUS_FILE" 2>/dev/null || echo false)"
+    if [ "$rr" = "true" ]; then
+      echo "==> reboot (required)"
+      start_phase reboot
+    else
+      echo "No reboot required."
+    fi
+  fi
+
+  echo
+  cmd_status
+}
+
+cmd_phase() {
+  local phase="$1"
+  require_root
+  start_phase "$phase" --block
+  if [ "$phase" = "activate" ]; then
+    sleep 1
+    wait_unit nixos-autoupdate-switch.service
+  fi
+  echo
+  cmd_status
+}
+
+set_status_hold() {
+  [ -f "$STATUS_FILE" ] || return 0
+  local tmp
+  tmp="$(mktemp "$STATE_DIR/.status.XXXXXX")"
+  if jq --argjson v "$1" '.hold=$v' "$STATUS_FILE" > "$tmp"; then
+    mv "$tmp" "$STATUS_FILE"
+  else
+    rm -f "$tmp"
+  fi
+}
+
+cmd_hold() {
+  require_root
+  ensure_run
+  echo "${1:-held via nixos-update}" > "$HOLD_FILE"
+  set_status_hold true
+  echo "nixos-autoupdate held (build/activate/reboot paused)."
+}
+
+cmd_unhold() {
+  require_root
+  rm -f "$HOLD_FILE"
+  set_status_hold false
+  echo "nixos-autoupdate resumed."
+}
+
+cmd_log() {
+  local follow=()
+  [ "${1:-}" = "-f" ] && follow=(-f)
+  journalctl "${follow[@]}" --no-pager \
+    -u nixos-autoupdate-check.service \
+    -u nixos-autoupdate-build.service \
+    -u nixos-autoupdate-activate.service \
+    -u nixos-autoupdate-switch.service \
+    -u nixos-autoupdate-reboot.service
+}
+
+main() {
+  local cmd="${1:-status}"
+  case "$cmd" in
+    status)              shift || true; cmd_status "${1:-}" ;;
+    run)                 shift || true; cmd_run "${1:-}" ;;
+    check|build|activate) cmd_phase "$cmd" ;;
+    reboot)              cmd_phase reboot ;;
+    hold)                shift || true; cmd_hold "${1:-}" ;;
+    unhold)              cmd_unhold ;;
+    log)                 shift || true; cmd_log "${1:-}" ;;
+    -h|--help|help)      usage ;;
+    *)                   echo "nixos-update: unknown command '$cmd'" >&2; usage; exit 1 ;;
+  esac
+}
+
+main "$@"

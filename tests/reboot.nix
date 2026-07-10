@@ -1,16 +1,41 @@
 { pkgs, lib, ... }:
 
 let
-  flakeNix = pkgs.writeText "flake.nix" ''
-    {
-      outputs = { ... }: {};
-    }
-  '';
-
   versionV1 = pkgs.writeText "version-v1" "1\n";
-  versionV2 = pkgs.writeText "version-v2" "2\n";
 
-  rebootSentinel = "/var/lib/reboot-would-have-happened";
+  # Fake toplevel whose kernel resolves to the booted *initrd* => differs from
+  # the booted kernel => reboot required. See tests/fake-system-flake.nix.
+  testFlake = pkgs.replaceVars ./fake-system-flake.nix {
+    bash = pkgs.bash;
+    coreutils = pkgs.coreutils;
+    system = pkgs.stdenv.hostPlatform.system;
+    kerneltarget = "/run/booted-system/initrd";
+  };
+
+  clientBase =
+    { pkgs, ... }:
+    {
+      imports = [ ../default.nix ];
+
+      system.extraDependencies = with pkgs; [
+        bash
+        coreutils
+      ];
+      nix.settings = {
+        experimental-features = [
+          "nix-command"
+          "flakes"
+        ];
+        sandbox = false;
+      };
+
+      environment.systemPackages = with pkgs; [ age ];
+      system.stateVersion = "25.11";
+      boot.loader.grub.enable = false;
+      fileSystems."/".device = "none";
+      networking.useDHCP = true;
+      networking.firewall.enable = false;
+    };
 in
 
 {
@@ -39,162 +64,132 @@ in
         system.stateVersion = "25.11";
       };
 
-    autoupdate =
+    # Live-switch node with auto-reboot enabled but a gate that always defers,
+    # so the VM never actually reboots.
+    autoreboot =
       { pkgs, ... }:
       {
-        imports = [ ../default.nix ];
-
+        imports = [ clientBase ];
+        networking.hostName = "autoreboot";
         nixos-autoupdate = {
           enable = true;
           repoUrl = "ssh://git@gitserver/var/lib/git/test-repo.git";
           branch = "main";
           flakeOutput = "nixosConfigurations.autoupdate";
-          frequency = "*-*-* *:*:00";
           ageKeyPath = "/var/lib/nixos/secrets/age.key";
           gitSshKey = "/var/lib/nixos/secrets/git-ssh-key.age";
-          rebuildCommand = ''
-            cp "$FLAKE_WORKTREE/version" /var/lib/selfupdate-version && ln -sfn /nonexistent-booted /run/booted-system
-          '';
-          autoReboot = "script";
-          rebootScript = pkgs.writeScript "reboot-check" ''
-            #!${pkgs.runtimeShell}
-            touch ${rebootSentinel}
-            exit 1
-          '';
+          check.frequency = "*-*-* *:*:00";
+          activate.mode = "switch";
+          reboot = {
+            enable = true;
+            gate = ''
+              mkdir -p /run/nixos-autoupdate
+              touch /run/nixos-autoupdate/reboot-gate-ran
+              exit 1
+            '';
+          };
           onRebootStatus = ''
             mkdir -p /run/nixos-autoupdate
-            echo "EVENT=$AUTOUPDATE_EVENT" > /run/nixos-autoupdate/on-reboot-status.env
-            echo "STATUS=$AUTOUPDATE_STATUS" >> /run/nixos-autoupdate/on-reboot-status.env
-            echo "REBOOT_REQUIRED=$AUTOUPDATE_REBOOT_REQUIRED" >> /run/nixos-autoupdate/on-reboot-status.env
-            echo "COMMIT=$AUTOUPDATE_CHECKED_OUT_COMMIT" >> /run/nixos-autoupdate/on-reboot-status.env
+            echo "$AUTOUPDATE_EVENT $AUTOUPDATE_STATUS reboot=$AUTOUPDATE_REBOOT_REQUIRED" \
+              >> /run/nixos-autoupdate/reboot-events.log
           '';
         };
+      };
 
-        environment.systemPackages = with pkgs; [ age ];
-        system.stateVersion = "25.11";
-        boot.loader.grub.enable = false;
-        fileSystems."/".device = "none";
-        networking.hostName = "autoupdate";
-        networking.useDHCP = true;
-        networking.firewall.enable = false;
+    # Boot-mode node: stages the new config for next boot, no live switch.
+    bootmode =
+      { pkgs, ... }:
+      {
+        imports = [ clientBase ];
+        networking.hostName = "bootmode";
+        nixos-autoupdate = {
+          enable = true;
+          repoUrl = "ssh://git@gitserver/var/lib/git/test-repo.git";
+          branch = "main";
+          flakeOutput = "nixosConfigurations.autoupdate";
+          ageKeyPath = "/var/lib/nixos/secrets/age.key";
+          gitSshKey = "/var/lib/nixos/secrets/git-ssh-key.age";
+          check.frequency = "*-*-* *:*:00";
+          activate.mode = "boot";
+          reboot.enable = false;
+        };
       };
   };
 
-  testScript =
-    { nodes, ... }:
-    ''
-      start_all()
+  testScript = ''
+    import json
 
-      gitserver.wait_for_unit("multi-user.target")
-      autoupdate.wait_for_unit("multi-user.target")
+    def status(node):
+        return json.loads(node.succeed("nixos-update status --json"))
 
-      with subtest("Setup autoupdate VM: age keypair"):
-          autoupdate.succeed("mkdir -p /var/lib/nixos/secrets")
-          autoupdate.succeed("chmod 700 /var/lib/nixos/secrets")
-          autoupdate.succeed("age-keygen -o /var/lib/nixos/secrets/age.key 2>&1")
-          autoupdate.succeed("chmod 600 /var/lib/nixos/secrets/age.key")
+    def setup_git_auth(node):
+        node.succeed("mkdir -p /var/lib/nixos/secrets")
+        node.succeed("chmod 700 /var/lib/nixos/secrets")
+        node.succeed("age-keygen -o /var/lib/nixos/secrets/age.key 2>&1")
+        node.succeed("chmod 600 /var/lib/nixos/secrets/age.key")
+        pubkey = node.succeed("age-keygen -y /var/lib/nixos/secrets/age.key").strip()
+        node.succeed("ssh-keygen -t ed25519 -N \"\" -f /var/lib/nixos/secrets/git-ssh-key")
+        node.succeed(
+            'age -e -r "' + pubkey + '" -o /var/lib/nixos/secrets/git-ssh-key.age '
+            "/var/lib/nixos/secrets/git-ssh-key"
+        )
+        node.succeed("chmod 600 /var/lib/nixos/secrets/git-ssh-key.age")
+        ssh_pubkey = node.succeed("cat /var/lib/nixos/secrets/git-ssh-key.pub").strip()
+        gitserver.succeed("mkdir -p ~git/.ssh")
+        gitserver.succeed('echo "' + ssh_pubkey + '" >> ~git/.ssh/authorized_keys')
+        gitserver.succeed("chmod 700 ~git/.ssh")
+        gitserver.succeed("chmod 600 ~git/.ssh/authorized_keys")
+        gitserver.succeed("chown -R git:git ~git")
 
-          pubkey = autoupdate.succeed(
-              "age-keygen -y /var/lib/nixos/secrets/age.key"
-          ).strip()
+    start_all()
 
-      with subtest("Setup autoupdate VM: SSH keypair encrypted with age"):
-          autoupdate.succeed(
-              "ssh-keygen -t ed25519 -N \"\" -f /var/lib/nixos/secrets/git-ssh-key"
-          )
-          autoupdate.succeed(
-              'age -e -r "' + pubkey + '" -o /var/lib/nixos/secrets/git-ssh-key.age '
-              "/var/lib/nixos/secrets/git-ssh-key"
-          )
-          autoupdate.succeed("chmod 600 /var/lib/nixos/secrets/git-ssh-key.age")
+    gitserver.wait_for_unit("multi-user.target")
+    autoreboot.wait_for_unit("multi-user.target")
+    bootmode.wait_for_unit("multi-user.target")
 
-          ssh_pubkey = autoupdate.succeed(
-              "cat /var/lib/nixos/secrets/git-ssh-key.pub"
-          ).strip()
+    with subtest("Setup git auth for both client nodes"):
+        setup_git_auth(autoreboot)
+        setup_git_auth(bootmode)
 
-      with subtest("Setup gitserver: authorized_keys"):
-          gitserver.succeed("mkdir -p ~git/.ssh")
-          gitserver.succeed(
-              'echo "' + ssh_pubkey + '" >> ~git/.ssh/authorized_keys'
-          )
-          gitserver.succeed("chmod 700 ~git/.ssh")
-          gitserver.succeed("chmod 600 ~git/.ssh/authorized_keys")
-          gitserver.succeed("chown -R git:git ~git")
+    with subtest("Setup gitserver: bare git repo and push v1"):
+        gitserver.succeed("mkdir -p /var/lib/git")
+        gitserver.succeed("git init --bare /var/lib/git/test-repo.git")
+        gitserver.succeed("chown -R git:git /var/lib/git")
+        gitserver.copy_from_host_via_shell("${testFlake}", "/tmp/flake.nix")
+        gitserver.copy_from_host_via_shell("${versionV1}", "/tmp/version")
+        gitserver.succeed("git config --global --add safe.directory /var/lib/git/test-repo.git")
+        gitserver.succeed(
+            "d=$(mktemp -d) && cd \"$d\" && git init && git branch -m main "
+            "&& git config user.email test@test.com && git config user.name Test "
+            "&& cp /tmp/flake.nix flake.nix && cp /tmp/version version "
+            "&& git add flake.nix version && git commit -m 'config v1' "
+            "&& git remote add origin /var/lib/git/test-repo.git "
+            "&& git push origin main && rm -rf \"$d\""
+        )
 
-      with subtest("Setup gitserver: bare git repo"):
-          gitserver.succeed("mkdir -p /var/lib/git")
-          gitserver.succeed("git init --bare /var/lib/git/test-repo.git")
-          gitserver.succeed("chown -R git:git /var/lib/git")
+    with subtest("autoreboot: build + activate creates the reboot sentinel"):
+        autoreboot.succeed("nixos-update run")
+        autoreboot.wait_until_succeeds("test \"$(cat /var/lib/selfupdate-version)\" = 1", timeout=90)
+        st = status(autoreboot)
+        assert st["reboot_required"] is True, st
+        assert st["applied_commit"] == st["fetched_commit"], st
+        autoreboot.succeed("test -f /run/nixos-autoupdate/reboot-required")
 
-      with subtest("Push v1 to git repo"):
-          gitserver.copy_from_host_via_shell("${flakeNix}", "/tmp/flake.nix")
-          gitserver.copy_from_host_via_shell("${../default.nix}", "/tmp/module.nix")
-          gitserver.copy_from_host_via_shell("${versionV1}", "/tmp/version")
+    with subtest("autoreboot: reboot phase runs the gate but defers"):
+        autoreboot.succeed("systemctl start nixos-autoupdate-reboot.service")
+        autoreboot.succeed("test -f /run/nixos-autoupdate/reboot-gate-ran")
+        events = autoreboot.succeed("cat /run/nixos-autoupdate/reboot-events.log")
+        assert "REBOOT_NEEDED" in events, events
+        assert "REBOOT_DEFERRED" in events, events
+        # Gate deferred, so the sentinel is still there and no reboot happened.
+        autoreboot.succeed("test -f /run/nixos-autoupdate/reboot-required")
 
-          gitserver.succeed(
-              "git config --global --add safe.directory /var/lib/git/test-repo.git"
-          )
-          gitserver.succeed(
-              "d=$(mktemp -d) && cd \"$d\" && git init && git branch -m main "
-              "&& git config user.email test@test.com && git config user.name Test "
-              "&& cp /tmp/flake.nix flake.nix && cp /tmp/module.nix default.nix "
-              "&& cp /tmp/version version && git add flake.nix default.nix version "
-              "&& git commit -m 'Initial config v1' "
-              "&& git remote add origin /var/lib/git/test-repo.git "
-              "&& git push origin main && rm -rf \"$d\""
-          )
-
-      with subtest("First service run: clone repo"):
-          autoupdate.succeed("systemctl start nixos-autoupdate.service")
-
-      with subtest("Push v2 to git repo"):
-          gitserver.copy_from_host_via_shell("${versionV2}", "/tmp/version2")
-
-          gitserver.succeed("""
-            WORKDIR=$(mktemp -d)
-            cd "$WORKDIR"
-            git clone -b main /var/lib/git/test-repo.git clone-dir
-            cd clone-dir
-            git config user.email "test@test.com"
-            git config user.name "Test"
-            cp /tmp/version2 version
-            git add version
-            git commit -m "Update to v2"
-            git push origin main
-            rm -rf "$WORKDIR"
-          """)
-
-      with subtest("Second service run: rebuild creates reboot sentinel"):
-          autoupdate.succeed("systemctl start nixos-autoupdate.service")
-
-      with subtest("Verify reboot sentinel was created"):
-          result = autoupdate.succeed(
-              "test -f /run/nixos-autoupdate/reboot-required && echo yes || echo no"
-          ).strip()
-          assert result == "yes", "Reboot sentinel was not created"
-
-      with subtest("Reboot service runs reboot script"):
-          autoupdate.succeed("systemctl start nixos-autoupdate-reboot.service")
-
-      with subtest("Verify on-reboot-status (REBOOT_NEEDED)"):
-          result = autoupdate.succeed("cat /run/nixos-autoupdate/on-reboot-status.env")
-          assert "EVENT=REBOOT_NEEDED" in result, "Expected REBOOT_NEEDED: " + result
-          assert "STATUS=REBOOT_NEEDED" in result
-          assert "REBOOT_REQUIRED=true" in result
-
-      with subtest("Verify rebuild happened and reboot script ran"):
-          import time
-          result = ""
-          for _ in range(15):
-              result = autoupdate.succeed("cat /var/lib/selfupdate-version").strip()
-              if result == "2":
-                  break
-              time.sleep(1)
-          assert result == "2", "Expected version 2, got {}".format(result)
-
-          sentinel = autoupdate.succeed(
-              "test -f ${rebootSentinel} && echo yes || echo no"
-          ).strip()
-          assert sentinel == "yes", "Reboot script did not run"
+    with subtest("bootmode: stages the config for next boot without live switch"):
+        bootmode.succeed("nixos-update run")
+        bootmode.wait_until_succeeds("test \"$(cat /var/lib/selfupdate-version)\" = 1", timeout=90)
+        st = status(bootmode)
+        assert st["applied_commit"] == st["fetched_commit"], st
+        # No transient live-switch unit is used in boot mode.
+        bootmode.fail("systemctl is-active --quiet nixos-autoupdate-switch.service")
     '';
 }
