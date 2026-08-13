@@ -25,6 +25,11 @@ Options:
                       the cache signs server-side)
   --operation <op>    Record "switch" or "boot" in the pointer, overriding the
                       host's activate.mode for this release
+  --root-on <host>    Register each published closure as a generation of
+                      /nix/var/nix/profiles/cache/<name> on this SSH host, so
+                      that the cache's garbage collector keeps it. Defaults to
+                      the host in --cache when that is an ssh:// or ssh-ng://
+                      URL; pass "none" to skip.
   --releases-dir <d>  Where pointers live (default: releases)
   --no-commit         Write the pointer files but do not git commit/push
   --push              git push after committing (default: commit only)
@@ -37,6 +42,7 @@ CACHE="${NIXOS_RELEASE_CACHE:-}"
 SIGN_KEY=""
 OPERATION=""
 RELEASES_DIR="releases"
+ROOT_ON=""
 DO_COMMIT=1
 DO_PUSH=0
 HOSTS=()
@@ -47,6 +53,7 @@ while [ $# -gt 0 ]; do
     --cache)        CACHE="$2"; shift 2 ;;
     --sign-with)    SIGN_KEY="$2"; shift 2 ;;
     --operation)    OPERATION="$2"; shift 2 ;;
+    --root-on)      ROOT_ON="$2"; shift 2 ;;
     --releases-dir) RELEASES_DIR="$2"; shift 2 ;;
     --no-commit)    DO_COMMIT=0; shift ;;
     --push)         DO_PUSH=1; shift ;;
@@ -72,6 +79,19 @@ case "$OPERATION" in
   *) echo "nixos-release: --operation must be switch or boot" >&2; exit 1 ;;
 esac
 
+# Closures pushed into a remote store are not GC roots there, so the cache's
+# own garbage collector would eventually delete them out from under the hosts
+# that still reference them. Pin each one as a generation of a per-host profile.
+# Default to the machine named by an ssh cache URL.
+if [ -z "$ROOT_ON" ]; then
+  case "$CACHE" in
+    ssh-ng://*) ROOT_ON="${CACHE#ssh-ng://}" ;;
+    ssh://*)    ROOT_ON="${CACHE#ssh://}" ;;
+    *)          ROOT_ON="none" ;;
+  esac
+  ROOT_ON="${ROOT_ON%%\?*}"   # drop any ?query parameters
+fi
+
 SOURCE_COMMIT="$(git rev-parse HEAD 2>/dev/null || echo "")"
 if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
   echo "nixos-release: WARNING — working tree is dirty; the recorded source" >&2
@@ -96,6 +116,14 @@ for host in "${HOSTS[@]}"; do
   fi
   # This must complete before the pointer is written.
   nix copy --to "$CACHE" "$storePath"
+
+  if [ "$ROOT_ON" != "none" ] && [ -n "$ROOT_ON" ]; then
+    echo "==> $host: pinning on $ROOT_ON so the cache will not collect it"
+    # A profile generation is a GC root, and gives `--delete-generations` as a
+    # correct retention policy on the cache side.
+    # shellcheck disable=SC2029  # $host/$storePath are meant to expand locally
+    ssh "$ROOT_ON" "sudo nix-env -p /nix/var/nix/profiles/cache/$host --set $storePath"
+  fi
 
   pointer="$RELEASES_DIR/$host.json"
   system="$(nix eval --raw "$FLAKE#nixosConfigurations.$host.pkgs.stdenv.hostPlatform.system")"

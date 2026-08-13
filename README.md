@@ -219,8 +219,15 @@ The agent needs only a substituter URL and a public key, so any backend works:
   once on every backend**. Backends differ only in whether they also dedup
   between *different versions* of a path.
 
-Whatever you pick, GC-root on the cache host the closures any pointer may still
-reference (current release plus whatever history you want to roll back to).
+Whatever you pick, the closures any pointer may still reference must be GC-rooted
+on the cache host. `nixos-release --root-on <host>` does this by making each
+published closure a generation of `/nix/var/nix/profiles/cache/<host>` there
+(defaulted from an `ssh://`/`ssh-ng://` cache URL), which turns retention into
+`nix-env --delete-generations +N` plus a normal `nix-collect-garbage`.
+
+Keep those profiles out of `/nix/var/nix/profiles/system-profiles/`: that
+directory and the system profile are exactly what the bootloaders enumerate, so
+cached configurations placed there would appear in the cache host's boot menu.
 
 ## Testing
 
