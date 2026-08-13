@@ -10,7 +10,7 @@ HOLD_FILE="$STATE_DIR/hold"
 
 UNITS=(
   nixos-autoupdate-check.service
-  nixos-autoupdate-build.service
+  nixos-autoupdate-fetch.service
   nixos-autoupdate-activate.service
   nixos-autoupdate-switch.service
   nixos-autoupdate-reboot.service
@@ -21,13 +21,13 @@ usage() {
 Usage: nixos-update [command]
 
   status [--json]   Show pipeline state (default command)
-  run [--reboot]    Run check + build + activate now, bypassing gates,
+  run [--reboot]    Run check + fetch + activate now, bypassing gates,
                     streaming logs; --reboot also reboots if required
-  check             Fetch and detect updates now
-  build             Build the pending config now (bypasses the build gate)
-  activate          Activate the built config now (bypasses the activate gate)
+  check             Poll the release pointer now
+  fetch             Download the released system closure now (bypasses the gate)
+  activate          Activate the fetched config now (bypasses the activate gate)
   reboot            Reboot now if a reboot is pending (bypasses the reboot gate)
-  hold [reason]     Pause build/activate/reboot (check keeps running)
+  hold [reason]     Pause fetch/activate/reboot (check keeps running)
   unhold            Resume the pipeline
   log [-f]          Show (or follow) logs across all pipeline units
 EOF
@@ -107,13 +107,14 @@ cmd_status() {
     return 0
   fi
 
-  local phase hold lc fetched built applied rr err
+  local phase hold lc desired fetched applied commit rr err
   phase="$(jq -r '.phase' "$STATUS_FILE")"
   hold="$(jq -r '.hold' "$STATUS_FILE")"
   lc="$(jq -r '.last_check // "never"' "$STATUS_FILE")"
-  fetched="$(jq -r '.fetched_commit // "-"' "$STATUS_FILE")"
-  built="$(jq -r '.built_commit // "-"' "$STATUS_FILE")"
-  applied="$(jq -r '.applied_commit // "-"' "$STATUS_FILE")"
+  desired="$(jq -r '.desired_path // "-"' "$STATUS_FILE")"
+  fetched="$(jq -r '.fetched_path // "-"' "$STATUS_FILE")"
+  applied="$(jq -r '.applied_path // "-"' "$STATUS_FILE")"
+  commit="$(jq -r '.desired_commit // "-"' "$STATUS_FILE")"
   rr="$(jq -r '.reboot_required' "$STATUS_FILE")"
   err="$(jq -r 'if .last_error==null then "-" else "[\(.last_error.phase)] \(.last_error.message)" end' "$STATUS_FILE")"
 
@@ -125,15 +126,16 @@ cmd_status() {
   fi
   echo "  hold:             $hold"
   echo "  last check:       $lc"
-  echo "  fetched commit:   $fetched"
-  echo "  built commit:     $built"
-  echo "  applied commit:   $applied"
+  echo "  desired:          $desired"
+  echo "  fetched:          $fetched"
+  echo "  applied:          $applied"
+  echo "  source commit:    $commit"
   echo "  reboot required:  $rr"
   echo "  last error:       $err"
 
-  if [ "$fetched" != "-" ] && [ "$fetched" != "$applied" ]; then
+  if [ "$desired" != "-" ] && [ "$desired" != "$applied" ]; then
     echo
-    echo "  update pending (fetched != applied)"
+    echo "  update pending (desired != applied)"
   fi
 }
 
@@ -145,7 +147,7 @@ cmd_run() {
 
   journalctl -n 0 -f --no-pager \
     -u nixos-autoupdate-check.service \
-    -u nixos-autoupdate-build.service \
+    -u nixos-autoupdate-fetch.service \
     -u nixos-autoupdate-activate.service \
     -u nixos-autoupdate-switch.service &
   local jpid=$!
@@ -154,8 +156,8 @@ cmd_run() {
 
   echo "==> check"
   start_phase check --block
-  echo "==> build"
-  start_phase build --block
+  echo "==> fetch"
+  start_phase fetch --block
   echo "==> activate"
   start_phase activate --block
   # activate spawns the transient switch unit; wait for it to finish.
@@ -214,7 +216,7 @@ cmd_hold() {
   ensure_run
   echo "${1:-held via nixos-update}" > "$HOLD_FILE"
   set_status_hold true
-  echo "nixos-autoupdate held (build/activate/reboot paused)."
+  echo "nixos-autoupdate held (fetch/activate/reboot paused)."
 }
 
 cmd_unhold() {
@@ -229,7 +231,7 @@ cmd_log() {
   [ "${1:-}" = "-f" ] && follow=(-f)
   journalctl "${follow[@]}" --no-pager \
     -u nixos-autoupdate-check.service \
-    -u nixos-autoupdate-build.service \
+    -u nixos-autoupdate-fetch.service \
     -u nixos-autoupdate-activate.service \
     -u nixos-autoupdate-switch.service \
     -u nixos-autoupdate-reboot.service
@@ -240,7 +242,7 @@ main() {
   case "$cmd" in
     status)              shift || true; cmd_status "${1:-}" ;;
     run)                 shift || true; cmd_run "${1:-}" ;;
-    check|build|activate) cmd_phase "$cmd" ;;
+    check|fetch|activate) cmd_phase "$cmd" ;;
     reboot)              cmd_phase reboot ;;
     hold)                shift || true; cmd_hold "${1:-}" ;;
     unhold)              cmd_unhold ;;

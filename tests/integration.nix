@@ -1,24 +1,27 @@
 { pkgs, lib, ... }:
 
 let
-  versionV1 = pkgs.writeText "version-v1" "1\n";
-  versionV2 = pkgs.writeText "version-v2" "2\n";
-  versionV3 = pkgs.writeText "version-v3" "3\n";
+  mkFakeSystem = import ./fake-system.nix { inherit pkgs; };
 
-  # Fake toplevel whose kernel matches the booted system => config-only change,
-  # no reboot required. See tests/fake-system-flake.nix.
-  testFlake = pkgs.replaceVars ./fake-system-flake.nix {
-    bash = pkgs.bash;
-    coreutils = pkgs.coreutils;
-    system = pkgs.stdenv.hostPlatform.system;
-    kerneltarget = "/run/booted-system/kernel";
-  };
+  # Config-only changes: kernel matches the booted one => no reboot required.
+  systemV1 = mkFakeSystem { version = "1"; };
+  systemV2 = mkFakeSystem { version = "2"; };
+  systemV3 = mkFakeSystem { version = "3"; };
+
+  # Test-only binary cache keypair (see tests/README rationale: committing a
+  # throwaway key keeps the test hermetic and avoids import-from-derivation).
+  cachePrivateKey =
+    "nixos-autoupdate-test-1:VA1/Z0atYO68Na+zWJy4+crFrfff7znKkkqYHmfuN8trztmgbe4tmtJRzAJ2M1Mm9XZL0FayMXj38LqcB61qGg==";
+  cachePublicKey = "nixos-autoupdate-test-1:a87ZoG3uLZrSUcwCdjNTJvV2S9BWsjF49/C6nAetaho=";
 in
 
 {
   name = "nixos-autoupdate-integration";
 
   nodes = {
+    # Stands in for the builder + infrastructure: serves the release repo over
+    # SSH and the binary cache over HTTP. It holds the built system closures
+    # (system.extraDependencies) exactly as a real builder would.
     gitserver =
       { pkgs, ... }:
       {
@@ -37,6 +40,33 @@ in
           settings.PermitRootLogin = "yes";
           settings.PasswordAuthentication = false;
         };
+
+        # The binary cache: a plain file:// store served as static files.
+        systemd.tmpfiles.rules = [ "d /var/www/cache 0755 root root -" ];
+        services.nginx = {
+          enable = true;
+          virtualHosts."cache" = {
+            default = true;
+            listen = [
+              {
+                addr = "0.0.0.0";
+                port = 80;
+              }
+            ];
+            root = "/var/www/cache";
+          };
+        };
+
+        system.extraDependencies = [
+          systemV1
+          systemV2
+          systemV3
+        ];
+        nix.settings.experimental-features = [
+          "nix-command"
+          "flakes"
+        ];
+
         networking.firewall.enable = false;
         system.stateVersion = "25.11";
       };
@@ -50,10 +80,14 @@ in
           enable = true;
           repoUrl = "ssh://git@gitserver/var/lib/git/test-repo.git";
           branch = "main";
-          flakeOutput = "nixosConfigurations.autoupdate";
           ageKeyPath = "/var/lib/nixos/secrets/age.key";
           gitSshKey = "/var/lib/nixos/secrets/git-ssh-key.age";
           check.frequency = "*-*-* *:*:00";
+
+          cache = {
+            url = "http://gitserver";
+            publicKey = cachePublicKey;
+          };
 
           onGitStatus = ''
             mkdir -p /run/nixos-autoupdate
@@ -61,7 +95,7 @@ in
               echo "EVENT=$AUTOUPDATE_EVENT"
               echo "STATUS=$AUTOUPDATE_STATUS"
               echo "HOSTNAME=$AUTOUPDATE_HOSTNAME"
-              echo "COMMIT=$AUTOUPDATE_CHECKED_OUT_COMMIT"
+              echo "PATH_=$AUTOUPDATE_STORE_PATH"
               echo "PHASE=$AUTOUPDATE_PHASE"
             } > /run/nixos-autoupdate/on-git-status.env
           '';
@@ -72,18 +106,12 @@ in
           '';
         };
 
-        # Seed the store so the fake toplevel builds offline inside the VM.
-        system.extraDependencies = with pkgs; [
-          bash
-          coreutils
+        # The target must be able to receive closures it did not build.
+        virtualisation.writableStore = true;
+        nix.settings.experimental-features = [
+          "nix-command"
+          "flakes"
         ];
-        nix.settings = {
-          experimental-features = [
-            "nix-command"
-            "flakes"
-          ];
-          sandbox = false;
-        };
 
         environment.systemPackages = with pkgs; [ age ];
         system.stateVersion = "25.11";
@@ -106,6 +134,7 @@ in
       start_all()
 
       gitserver.wait_for_unit("multi-user.target")
+      gitserver.wait_for_unit("nginx.service")
       autoupdate.wait_for_unit("multi-user.target")
 
       with subtest("Setup autoupdate VM: age keypair"):
@@ -131,51 +160,80 @@ in
           gitserver.succeed("chmod 600 ~git/.ssh/authorized_keys")
           gitserver.succeed("chown -R git:git ~git")
 
-      with subtest("Setup gitserver: bare git repo"):
+      with subtest("Setup gitserver: bare release repo"):
           gitserver.succeed("mkdir -p /var/lib/git")
           gitserver.succeed("git init --bare /var/lib/git/test-repo.git")
           gitserver.succeed("chown -R git:git /var/lib/git")
-
-      def push_version(version_store_path, message):
-          gitserver.copy_from_host_via_shell("${testFlake}", "/tmp/flake.nix")
-          gitserver.copy_from_host_via_shell(version_store_path, "/tmp/version")
           gitserver.succeed("git config --global --add safe.directory /var/lib/git/test-repo.git")
+
+      with subtest("Builder: publish the system closures to the binary cache"):
+          # Signing key never leaves the builder; hosts only get the public key.
+          gitserver.succeed(
+              "umask 077 && printf '%s' '${cachePrivateKey}' > /root/cache.sec"
+          )
+          for path in ["${systemV1}", "${systemV2}", "${systemV3}"]:
+              gitserver.succeed(
+                  "nix copy --to 'file:///var/www/cache?secret-key=/root/cache.sec' " + path
+              )
+          # The cache is now a real, servable binary cache.
+          gitserver.succeed("test -f /var/www/cache/nix-cache-info")
+
+      def push_release(store_path, message, operation=None):
+          """Write releases/autoupdate.json and push it — this is what CI does."""
+          pointer = {
+              "storePath": store_path,
+              "system": "x86_64-linux",
+              "builtFrom": {"commit": "deadbeef", "flake": "hosts/autoupdate"},
+              "builtAt": "2026-08-11T00:00:00Z",
+          }
+          if operation is not None:
+              pointer["operation"] = operation
+          import base64
+          blob = base64.b64encode(json.dumps(pointer).encode()).decode()
+          gitserver.succeed("echo " + blob + " | base64 -d > /tmp/release.json")
           gitserver.succeed(
               "d=$(mktemp -d) && cd \"$d\" "
               "&& git clone -b main /var/lib/git/test-repo.git . 2>/dev/null "
               "|| { git init && git branch -m main && git remote add origin /var/lib/git/test-repo.git; } "
               "&& git config user.email test@test.com && git config user.name Test "
-              "&& cp /tmp/flake.nix flake.nix && cp /tmp/version version "
-              "&& git add flake.nix version "
+              "&& mkdir -p releases && cp /tmp/release.json releases/autoupdate.json "
+              "&& git add releases/autoupdate.json "
               "&& git commit -m '" + message + "' "
               "&& git push origin main && rm -rf \"$d\""
           )
 
-      with subtest("Push v1"):
-          push_version("${versionV1}", "config v1")
+      with subtest("Release v1"):
+          push_release("${systemV1}", "release v1")
 
-      with subtest("check detects the first update"):
+      with subtest("The target does not have the closure yet"):
+          autoupdate.fail("nix-store --check-validity ${systemV1}")
+
+      with subtest("check records the desired store path"):
           autoupdate.succeed("systemctl start nixos-autoupdate-check.service")
           result = autoupdate.succeed("cat /run/nixos-autoupdate/on-git-status.env")
           assert "EVENT=UPDATE_FOUND" in result, result
           assert "STATUS=OK" in result
           assert "PHASE=check" in result
           st = status(autoupdate)
-          assert st["fetched_commit"], st
-          assert st["applied_commit"] is None, st
+          assert st["desired_path"] == "${systemV1}", st
+          # check must not download anything.
+          autoupdate.fail("nix-store --check-validity ${systemV1}")
 
-      with subtest("build then activate v1"):
-          autoupdate.succeed("systemctl start nixos-autoupdate-build.service")
+      with subtest("fetch downloads the closure from the cache"):
+          autoupdate.succeed("systemctl start nixos-autoupdate-fetch.service")
+          autoupdate.succeed("nix-store --check-validity ${systemV1}")
           st = status(autoupdate)
-          assert st["built_commit"] == st["fetched_commit"], st
+          assert st["fetched_path"] == "${systemV1}", st
           assert st["reboot_required"] is False, st
+          apply_log = autoupdate.succeed("cat /run/nixos-autoupdate/apply-events.log")
+          assert "FETCH_OK OK" in apply_log, apply_log
 
+      with subtest("activate switches to the fetched system"):
           autoupdate.succeed("systemctl start nixos-autoupdate-activate.service")
           autoupdate.wait_until_succeeds("test \"$(cat /var/lib/selfupdate-version)\" = 1", timeout=30)
           st = status(autoupdate)
-          assert st["applied_commit"] == st["built_commit"], st
+          assert st["applied_path"] == "${systemV1}", st
           apply_log = autoupdate.succeed("cat /run/nixos-autoupdate/apply-events.log")
-          assert "BUILD_OK OK" in apply_log, apply_log
           assert "SUCCESS OK" in apply_log, apply_log
 
       with subtest("no reboot required for a config-only change"):
@@ -183,33 +241,35 @@ in
           assert st["reboot_required"] is False, st
           autoupdate.fail("test -f /run/nixos-autoupdate/reboot-required")
 
-      with subtest("Push v2 and run the whole pipeline via the CLI"):
-          push_version("${versionV2}", "config v2")
+      with subtest("Release v2 and run the whole pipeline via the CLI"):
+          push_release("${systemV2}", "release v2")
           autoupdate.succeed("nixos-update run")
           autoupdate.wait_until_succeeds("test \"$(cat /var/lib/selfupdate-version)\" = 2", timeout=60)
           st = status(autoupdate)
-          assert st["applied_commit"] == st["fetched_commit"], st
+          assert st["applied_path"] == "${systemV2}", st
+          assert st["applied_path"] == st["desired_path"], st
 
-      with subtest("hold defers the build"):
+      with subtest("hold defers the fetch"):
           autoupdate.succeed("nixos-update hold 'testing'")
-          push_version("${versionV3}", "config v3")
+          push_release("${systemV3}", "release v3")
           autoupdate.succeed("systemctl start nixos-autoupdate-check.service")
           autoupdate.succeed("rm -f /run/nixos-autoupdate/apply-events.log")
-          autoupdate.succeed("systemctl start nixos-autoupdate-build.service")
+          autoupdate.succeed("systemctl start nixos-autoupdate-fetch.service")
           apply_log = autoupdate.succeed("cat /run/nixos-autoupdate/apply-events.log")
-          assert "BUILD_DEFERRED" in apply_log, apply_log
-          # still on v2
+          assert "FETCH_DEFERRED" in apply_log, apply_log
+          # nothing downloaded, still on v2
+          autoupdate.fail("nix-store --check-validity ${systemV3}")
           assert autoupdate.succeed("cat /var/lib/selfupdate-version").strip() == "2"
           st = status(autoupdate)
           assert st["hold"] is True, st
 
       with subtest("unhold lets it proceed to v3"):
           autoupdate.succeed("nixos-update unhold")
-          autoupdate.succeed("systemctl start nixos-autoupdate-build.service")
+          autoupdate.succeed("systemctl start nixos-autoupdate-fetch.service")
           autoupdate.succeed("systemctl start nixos-autoupdate-activate.service")
           autoupdate.wait_until_succeeds("test \"$(cat /var/lib/selfupdate-version)\" = 3", timeout=60)
           st = status(autoupdate)
           assert st["hold"] is False, st
-          assert st["applied_commit"] == st["fetched_commit"], st
+          assert st["applied_path"] == "${systemV3}", st
     '';
 }

@@ -4,7 +4,10 @@
 #
 # Expects from config.env: AU_HOSTNAME, and (optionally) AGE_KEY_PATH,
 # GIT_SSH_KEY, ON_GIT_STATUS, ON_APPLY_STATUS, ON_REBOOT_STATUS.
-# Expects the sourcing script to set PHASE (check|build|activate|reboot).
+# Expects the sourcing script to set PHASE (check|fetch|activate|reboot).
+#
+# v2 tracks store paths, not commits: the desired system state is the artifact
+# named by the release pointer. See DESIGN-v2.md.
 
 STATE_DIR="/var/lib/nixos-mgmt"
 RUN_DIR="/run/nixos-autoupdate"
@@ -13,7 +16,6 @@ STATUS_LOCK="$STATE_DIR/.status.lock"
 PENDING_SYSTEM="$STATE_DIR/pending-system"
 SENTINEL="$RUN_DIR/reboot-required"
 HOLD_FILE="$STATE_DIR/hold"
-LEGACY_APPLIED="$STATE_DIR/last-applied-commit"
 
 log()   { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 error() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $*" >&2; }
@@ -39,9 +41,10 @@ _with_status_lock() {
   ) 9>>"$STATUS_LOCK"
 }
 
-# Create status.json on first run, seeding applied_commit from the legacy
-# last-applied-commit file so upgrading from the old module does not trigger a
-# spurious rebuild.
+# Create status.json on first run. applied_path is seeded from the currently
+# running system, which is self-describing: a freshly installed host therefore
+# already knows what it runs, and a pointer naming that same path is a no-op
+# instead of a spurious re-activation.
 status_init() {
   ensure_dirs
   [ -f "$STATUS_FILE" ] && return 0
@@ -52,26 +55,18 @@ _status_init_write() {
   # Re-check under the lock in case another phase created it in the meantime.
   [ -f "$STATUS_FILE" ] && return 0
 
-  local applied=""
-  if [ -f "$LEGACY_APPLIED" ]; then
-    applied="$(cat "$LEGACY_APPLIED" 2>/dev/null || echo "")"
-  fi
+  local applied
+  applied="$(readlink -f /run/current-system 2>/dev/null || echo "")"
 
   local tmp
   tmp="$(mktemp "$STATE_DIR/.status.XXXXXX")"
-  if [ -n "$applied" ]; then
-    jq -n --arg a "$applied" '{
-      phase:"idle", hold:false, last_check:null,
-      fetched_commit:null, built_commit:null, applied_commit:$a,
-      reboot_required:false, last_error:null
-    }' > "$tmp"
-  else
-    jq -n '{
-      phase:"idle", hold:false, last_check:null,
-      fetched_commit:null, built_commit:null, applied_commit:null,
-      reboot_required:false, last_error:null
-    }' > "$tmp"
-  fi
+  jq -n --arg a "$applied" '{
+    phase:"idle", hold:false, last_check:null,
+    desired_path:null, desired_commit:null, desired_operation:null,
+    fetched_path:null,
+    applied_path:(if $a=="" then null else $a end), applied_commit:null,
+    reboot_required:false, last_error:null
+  }' > "$tmp"
   mv "$tmp" "$STATUS_FILE"
 }
 
@@ -109,15 +104,15 @@ status_error() {
 }
 status_clear_error() { _status_apply '.last_error=null'; }
 
-# Resting phase, derived from commits + sentinel, for human-readable status.
+# Resting phase, derived from store paths + sentinel, for human-readable status.
 status_settle() {
-  local applied built p
-  applied="$(status_get applied_commit)"
-  built="$(status_get built_commit)"
+  local applied fetched p
+  applied="$(status_get applied_path)"
+  fetched="$(status_get fetched_path)"
   if [ -f "$SENTINEL" ]; then
     p="reboot-pending"
-  elif [ -n "$built" ] && [ "$built" != "$applied" ] && [ -e "$PENDING_SYSTEM" ]; then
-    p="built"
+  elif [ -n "$fetched" ] && [ "$fetched" != "$applied" ] && [ -e "$PENDING_SYSTEM" ]; then
+    p="fetched"
   else
     p="idle"
   fi
@@ -147,7 +142,10 @@ gate_ok() {
 
 # Run a status hook with the AUTOUPDATE_* environment. Never fails the caller.
 emit() {
-  # emit <hook-or-empty> <event> <status> <message> <commit> <reboot_required>
+  # emit <hook-or-empty> <event> <status> <message> <commit> <reboot_required> [store-path]
+  # AUTOUPDATE_CHECKED_OUT_COMMIT keeps its name (and the source commit the
+  # artifact was built from) so existing hook scripts keep working; v2 adds
+  # AUTOUPDATE_STORE_PATH, which is the actual identity of the deployed system.
   local hook="$1"
   [ -z "$hook" ] && return 0
   AUTOUPDATE_EVENT="$2" \
@@ -155,6 +153,7 @@ emit() {
   AUTOUPDATE_MESSAGE="$4" \
   AUTOUPDATE_CHECKED_OUT_COMMIT="$5" \
   AUTOUPDATE_REBOOT_REQUIRED="$6" \
+  AUTOUPDATE_STORE_PATH="${7:-}" \
   AUTOUPDATE_HOSTNAME="$AU_HOSTNAME" \
   AUTOUPDATE_HOST_IP="$(host_ip)" \
   AUTOUPDATE_PHASE="$PHASE" \

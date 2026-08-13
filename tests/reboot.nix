@@ -1,33 +1,29 @@
 { pkgs, lib, ... }:
 
 let
-  versionV1 = pkgs.writeText "version-v1" "1\n";
+  mkFakeSystem = import ./fake-system.nix { inherit pkgs; };
 
-  # Fake toplevel whose kernel resolves to the booted *initrd* => differs from
-  # the booted kernel => reboot required. See tests/fake-system-flake.nix.
-  testFlake = pkgs.replaceVars ./fake-system-flake.nix {
-    bash = pkgs.bash;
-    coreutils = pkgs.coreutils;
-    system = pkgs.stdenv.hostPlatform.system;
-    kerneltarget = "/run/booted-system/initrd";
+  # kernel resolves to the booted *initrd*, i.e. differs from the booted kernel
+  # => a reboot is required to fully apply this system.
+  systemV1 = mkFakeSystem {
+    version = "1";
+    kernelTarget = "/run/booted-system/initrd";
   };
+
+  cachePrivateKey =
+    "nixos-autoupdate-test-1:VA1/Z0atYO68Na+zWJy4+crFrfff7znKkkqYHmfuN8trztmgbe4tmtJRzAJ2M1Mm9XZL0FayMXj38LqcB61qGg==";
+  cachePublicKey = "nixos-autoupdate-test-1:a87ZoG3uLZrSUcwCdjNTJvV2S9BWsjF49/C6nAetaho=";
 
   clientBase =
     { pkgs, ... }:
     {
       imports = [ ../default.nix ];
 
-      system.extraDependencies = with pkgs; [
-        bash
-        coreutils
+      virtualisation.writableStore = true;
+      nix.settings.experimental-features = [
+        "nix-command"
+        "flakes"
       ];
-      nix.settings = {
-        experimental-features = [
-          "nix-command"
-          "flakes"
-        ];
-        sandbox = false;
-      };
 
       environment.systemPackages = with pkgs; [ age ];
       system.stateVersion = "25.11";
@@ -36,6 +32,19 @@ let
       networking.useDHCP = true;
       networking.firewall.enable = false;
     };
+
+  commonAutoupdate = {
+    enable = true;
+    repoUrl = "ssh://git@gitserver/var/lib/git/test-repo.git";
+    branch = "main";
+    ageKeyPath = "/var/lib/nixos/secrets/age.key";
+    gitSshKey = "/var/lib/nixos/secrets/git-ssh-key.age";
+    check.frequency = "*-*-* *:*:00";
+    cache = {
+      url = "http://gitserver";
+      publicKey = cachePublicKey;
+    };
+  };
 in
 
 {
@@ -60,6 +69,28 @@ in
           settings.PermitRootLogin = "yes";
           settings.PasswordAuthentication = false;
         };
+
+        systemd.tmpfiles.rules = [ "d /var/www/cache 0755 root root -" ];
+        services.nginx = {
+          enable = true;
+          virtualHosts."cache" = {
+            default = true;
+            listen = [
+              {
+                addr = "0.0.0.0";
+                port = 80;
+              }
+            ];
+            root = "/var/www/cache";
+          };
+        };
+
+        system.extraDependencies = [ systemV1 ];
+        nix.settings.experimental-features = [
+          "nix-command"
+          "flakes"
+        ];
+
         networking.firewall.enable = false;
         system.stateVersion = "25.11";
       };
@@ -71,14 +102,8 @@ in
       {
         imports = [ clientBase ];
         networking.hostName = "autoreboot";
-        nixos-autoupdate = {
-          enable = true;
-          repoUrl = "ssh://git@gitserver/var/lib/git/test-repo.git";
-          branch = "main";
-          flakeOutput = "nixosConfigurations.autoupdate";
-          ageKeyPath = "/var/lib/nixos/secrets/age.key";
-          gitSshKey = "/var/lib/nixos/secrets/git-ssh-key.age";
-          check.frequency = "*-*-* *:*:00";
+        nixos-autoupdate = commonAutoupdate // {
+          releaseFile = "releases/autoreboot.json";
           activate.mode = "switch";
           reboot = {
             enable = true;
@@ -96,20 +121,14 @@ in
         };
       };
 
-    # Boot-mode node: stages the new config for next boot, no live switch.
+    # Boot-mode node: stages the new system for next boot, no live switch.
     bootmode =
       { pkgs, ... }:
       {
         imports = [ clientBase ];
         networking.hostName = "bootmode";
-        nixos-autoupdate = {
-          enable = true;
-          repoUrl = "ssh://git@gitserver/var/lib/git/test-repo.git";
-          branch = "main";
-          flakeOutput = "nixosConfigurations.autoupdate";
-          ageKeyPath = "/var/lib/nixos/secrets/age.key";
-          gitSshKey = "/var/lib/nixos/secrets/git-ssh-key.age";
-          check.frequency = "*-*-* *:*:00";
+        nixos-autoupdate = commonAutoupdate // {
+          releaseFile = "releases/bootmode.json";
           activate.mode = "boot";
           reboot.enable = false;
         };
@@ -117,7 +136,7 @@ in
   };
 
   testScript = ''
-    import json
+    import json, base64
 
     def status(node):
         return json.loads(node.succeed("nixos-update status --json"))
@@ -144,6 +163,7 @@ in
     start_all()
 
     gitserver.wait_for_unit("multi-user.target")
+    gitserver.wait_for_unit("nginx.service")
     autoreboot.wait_for_unit("multi-user.target")
     bootmode.wait_for_unit("multi-user.target")
 
@@ -151,28 +171,44 @@ in
         setup_git_auth(autoreboot)
         setup_git_auth(bootmode)
 
-    with subtest("Setup gitserver: bare git repo and push v1"):
+    with subtest("Builder: bare repo + publish the closure to the cache"):
         gitserver.succeed("mkdir -p /var/lib/git")
         gitserver.succeed("git init --bare /var/lib/git/test-repo.git")
         gitserver.succeed("chown -R git:git /var/lib/git")
-        gitserver.copy_from_host_via_shell("${testFlake}", "/tmp/flake.nix")
-        gitserver.copy_from_host_via_shell("${versionV1}", "/tmp/version")
         gitserver.succeed("git config --global --add safe.directory /var/lib/git/test-repo.git")
+        gitserver.succeed(
+            "umask 077 && printf '%s' '${cachePrivateKey}' > /root/cache.sec"
+        )
+        gitserver.succeed(
+            "nix copy --to 'file:///var/www/cache?secret-key=/root/cache.sec' ${systemV1}"
+        )
+
+    with subtest("Release the same system to both hosts"):
+        pointer = {
+            "storePath": "${systemV1}",
+            "system": "x86_64-linux",
+            "builtFrom": {"commit": "deadbeef", "flake": "hosts/test"},
+            "builtAt": "2026-08-11T00:00:00Z",
+        }
+        blob = base64.b64encode(json.dumps(pointer).encode()).decode()
+        gitserver.succeed("echo " + blob + " | base64 -d > /tmp/release.json")
         gitserver.succeed(
             "d=$(mktemp -d) && cd \"$d\" && git init && git branch -m main "
             "&& git config user.email test@test.com && git config user.name Test "
-            "&& cp /tmp/flake.nix flake.nix && cp /tmp/version version "
-            "&& git add flake.nix version && git commit -m 'config v1' "
+            "&& mkdir -p releases "
+            "&& cp /tmp/release.json releases/autoreboot.json "
+            "&& cp /tmp/release.json releases/bootmode.json "
+            "&& git add releases && git commit -m 'release v1' "
             "&& git remote add origin /var/lib/git/test-repo.git "
             "&& git push origin main && rm -rf \"$d\""
         )
 
-    with subtest("autoreboot: build + activate creates the reboot sentinel"):
+    with subtest("autoreboot: fetch + activate creates the reboot sentinel"):
         autoreboot.succeed("nixos-update run")
         autoreboot.wait_until_succeeds("test \"$(cat /var/lib/selfupdate-version)\" = 1", timeout=90)
         st = status(autoreboot)
         assert st["reboot_required"] is True, st
-        assert st["applied_commit"] == st["fetched_commit"], st
+        assert st["applied_path"] == "${systemV1}", st
         autoreboot.succeed("test -f /run/nixos-autoupdate/reboot-required")
 
     with subtest("autoreboot: reboot phase runs the gate but defers"):
@@ -184,12 +220,12 @@ in
         # Gate deferred, so the sentinel is still there and no reboot happened.
         autoreboot.succeed("test -f /run/nixos-autoupdate/reboot-required")
 
-    with subtest("bootmode: stages the config for next boot without live switch"):
+    with subtest("bootmode: stages the system for next boot without live switch"):
         bootmode.succeed("nixos-update run")
         bootmode.wait_until_succeeds("test \"$(cat /var/lib/selfupdate-version)\" = 1", timeout=90)
         st = status(bootmode)
-        assert st["applied_commit"] == st["fetched_commit"], st
+        assert st["applied_path"] == "${systemV1}", st
         # No transient live-switch unit is used in boot mode.
         bootmode.fail("systemctl is-active --quiet nixos-autoupdate-switch.service")
-    '';
+  '';
 }

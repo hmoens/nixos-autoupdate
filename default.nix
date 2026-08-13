@@ -35,16 +35,8 @@ let
     name: text:
     lib.optionalString (text != null) "${pkgs.writeShellScript "nixos-autoupdate-${name}" text}";
 
-  nixBuildFlags = lib.concatStringsSep " " (
-    [
-      "--cores"
-      (toString cfg.build.resources.cores)
-    ]
-    ++ lib.optionals (cfg.build.resources.maxJobs != null) [
-      "--max-jobs"
-      (toString cfg.build.resources.maxJobs)
-    ]
-  );
+  releaseFile =
+    if cfg.releaseFile != null then cfg.releaseFile else "releases/${config.networking.hostName}.json";
 
   configEnv = pkgs.writeText "nixos-autoupdate-config.env" ''
     RUNTIME_PATH='${runtimePath}'
@@ -53,19 +45,19 @@ let
     REPO_URL='${cfg.repoUrl}'
     REPO_PATH='${toString cfg.repoPath}'
     BRANCH='${cfg.branch}'
-    FLAKE_OUTPUT='${cfg.flakeOutput}'
-    FLAKE_SUBDIR='${cfg.flakeSubdir}'
+    RELEASE_FILE='${releaseFile}'
+    CACHE_URL='${cfg.cache.url}'
+    VERIFY_COMMITS='${lib.boolToString cfg.verifyCommitSignatures}'
     AGE_KEY_PATH='${lib.optionalString (cfg.ageKeyPath != null) (toString cfg.ageKeyPath)}'
     GIT_SSH_KEY='${lib.optionalString (cfg.gitSshKey != null) (toString cfg.gitSshKey)}'
     ON_GIT_STATUS='${optScript "on-git-status" cfg.onGitStatus}'
     ON_APPLY_STATUS='${optScript "on-apply-status" cfg.onApplyStatus}'
     ON_REBOOT_STATUS='${optScript "on-reboot-status" cfg.onRebootStatus}'
-    BUILD_GATE='${optScript "build-gate" cfg.build.gate}'
+    FETCH_GATE='${optScript "fetch-gate" cfg.fetch.gate}'
     ACTIVATE_GATE='${optScript "activate-gate" cfg.activate.gate}'
     REBOOT_GATE='${optScript "reboot-gate" cfg.reboot.gate}'
     ACTIVATE_MODE='${cfg.activate.mode}'
     REBOOT_ENABLE='${lib.boolToString cfg.reboot.enable}'
-    NIX_BUILD_FLAGS='${nixBuildFlags}'
   '';
 
   nixosUpdateCli = pkgs.runCommand "nixos-update" { nativeBuildInputs = [ pkgs.makeWrapper ]; } ''
@@ -100,11 +92,15 @@ in
 {
   options = {
     nixos-autoupdate = {
-      enable = lib.mkEnableOption "Self-update system that pulls config from git and rebuilds";
+      enable = lib.mkEnableOption ''
+        Self-updating system that pulls a pre-built system closure from a binary
+        cache, as named by a release pointer in git. The host never evaluates or
+        builds anything: see DESIGN-v2.md
+      '';
 
       repoUrl = lib.mkOption {
         type = types.str;
-        description = "Git repository URL to pull updates from";
+        description = "Git repository URL holding the release pointers";
         example = "https://github.com/user/nix-config";
       };
 
@@ -114,29 +110,63 @@ in
         description = "Git branch to track";
       };
 
-      flakeOutput = lib.mkOption {
-        type = types.str;
-        default = "nixos";
+      releaseFile = lib.mkOption {
+        type = types.nullOr types.str;
+        default = null;
         description = ''
-          Flake output to activate, e.g. "nixosConfigurations.nas" or just "nas".
-          The last component is used as the configuration name; the module builds
-          `<flake>#nixosConfigurations.<name>.config.system.build.toplevel`.
+          Path within the repo of this host's release pointer, a JSON file with
+          at least a `storePath` key naming the system closure to run. Defaults
+          to "releases/<hostname>.json".
+
+          The pointer may also carry `operation` ("switch" or "boot") to
+          override [](#opt-nixos-autoupdate.activate.mode) for one release, and
+          `builtFrom.commit` / `builtAt` for provenance.
         '';
-        example = "nixosConfigurations.nas";
+        example = "releases/nas.json";
       };
 
       repoPath = lib.mkOption {
         type = types.path;
         default = "/var/lib/nixos-mgmt/repo";
-        description = "Local path where the git repository is stored";
+        description = ''
+          Local path for the release repository clone. Cloned with
+          `--no-checkout`: the host only reads the pointer file out of the git
+          object store and never materialises a working tree.
+        '';
       };
 
-      flakeSubdir = lib.mkOption {
-        type = types.str;
-        default = "";
+      cache = {
+        url = lib.mkOption {
+          type = types.str;
+          default = "";
+          description = ''
+            Binary cache to fetch system closures from, e.g.
+            "https://cache.example.net" or "s3://my-bucket". Added to
+            `nix.settings.substituters`. When empty, the fetch phase falls back
+            to whatever substituters the system already has configured.
+          '';
+          example = "https://cache.example.net";
+        };
+        publicKey = lib.mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          description = ''
+            Public key used to verify closures from [](#opt-nixos-autoupdate.cache.url),
+            added to `nix.settings.trusted-public-keys`. Signatures are always
+            verified; the fetch never passes `--no-check-sigs`.
+          '';
+          example = "cache.example.net:AbCdEf0123456789...=";
+        };
+      };
+
+      verifyCommitSignatures = lib.mkOption {
+        type = types.bool;
+        default = false;
         description = ''
-          Subdirectory within the git repo containing the Nix flake to build.
-          Use when your flake is not at the repo root, e.g. "hosts/nas".
+          Require a valid signature on the release-pointer commit before acting
+          on it. A signed closure alone does not prove the host was pointed at
+          the *right* closure, so signing the pointer closes that gap. Requires
+          the allowed signers to be configured for git on the host.
         '';
       };
 
@@ -167,52 +197,21 @@ in
         };
       };
 
-      build = {
+      fetch = {
         gate = lib.mkOption {
           type = types.nullOr types.lines;
           default = null;
           description = ''
-            Shell script deciding whether to build now. Exit 0 to proceed, non-zero
-            to defer to the next build tick. Receives the AUTOUPDATE_* environment.
-            Typically used to avoid building under load. null = always build.
+            Shell script deciding whether to download the new system closure now.
+            Exit 0 to proceed, non-zero to defer to the next fetch tick. Receives
+            the AUTOUPDATE_* environment. Typically used to avoid downloading over
+            a metered or busy link. null = always fetch.
           '';
         };
         frequency = lib.mkOption {
           type = types.str;
           default = "*-*-* *:0/10:00";
-          description = "How often to (re)attempt a deferred build (systemd OnCalendar format)";
-        };
-        resources = {
-          cpuWeight = lib.mkOption {
-            type = types.int;
-            default = 25;
-            description = "systemd CPUWeight for the build unit (1-10000, lower yields under contention)";
-          };
-          nice = lib.mkOption {
-            type = types.int;
-            default = 15;
-            description = "systemd Nice level for the build unit";
-          };
-          ioSchedulingClass = lib.mkOption {
-            type = types.str;
-            default = "idle";
-            description = "systemd IOSchedulingClass for the build unit";
-          };
-          memoryHigh = lib.mkOption {
-            type = types.str;
-            default = "50%";
-            description = "systemd MemoryHigh throttling threshold for the build unit";
-          };
-          cores = lib.mkOption {
-            type = types.int;
-            default = 0;
-            description = "nix build --cores (0 = all available)";
-          };
-          maxJobs = lib.mkOption {
-            type = types.nullOr types.int;
-            default = null;
-            description = "nix build --max-jobs (null = nix default)";
-          };
+          description = "How often to (re)attempt a deferred fetch (systemd OnCalendar format)";
         };
       };
 
@@ -286,9 +285,9 @@ in
         type = types.nullOr types.lines;
         default = null;
         description = ''
-          Shell script run after each build and activation attempt. Called with
-          AUTOUPDATE_* environment variables. Events: BUILD_OK, BUILD_FAILED,
-          BUILD_DEFERRED, ACTIVATE_DEFERRED, SUCCESS, APPLY_FAILED.
+          Shell script run after each fetch and activation attempt. Called with
+          AUTOUPDATE_* environment variables. Events: FETCH_OK, FETCH_FAILED,
+          FETCH_DEFERRED, ACTIVATE_DEFERRED, SUCCESS, APPLY_FAILED.
         '';
       };
 
@@ -311,10 +310,17 @@ in
       }
     ];
 
+    warnings = lib.optional (cfg.cache.url != "" && cfg.cache.publicKey == null) ''
+      nixos-autoupdate: cache.url is set but cache.publicKey is not. Closures
+      from that cache will only be accepted if they are signed by a key this
+      host already trusts, so fetches will fail unless the key is configured
+      elsewhere.
+    '';
+
     environment.etc."nixos-autoupdate/config.env".source = configEnv;
     environment.etc."nixos-autoupdate/lib.sh".source = ./scripts/lib.sh;
     environment.etc."nixos-autoupdate/check.sh".source = ./scripts/check.sh;
-    environment.etc."nixos-autoupdate/build.sh".source = ./scripts/build.sh;
+    environment.etc."nixos-autoupdate/fetch.sh".source = ./scripts/fetch.sh;
     environment.etc."nixos-autoupdate/activate.sh".source = ./scripts/activate.sh;
     environment.etc."nixos-autoupdate/apply.sh".source = ./scripts/apply.sh;
     environment.etc."nixos-autoupdate/reboot.sh".source = ./scripts/reboot.sh;
@@ -328,10 +334,10 @@ in
           RandomizedDelaySec = "60sec";
         };
       };
-      nixos-autoupdate-build = {
+      nixos-autoupdate-fetch = {
         wantedBy = [ "timers.target" ];
         timerConfig = {
-          OnCalendar = cfg.build.frequency;
+          OnCalendar = cfg.fetch.frequency;
           Persistent = true;
         };
       };
@@ -355,7 +361,7 @@ in
 
     systemd.services = {
       nixos-autoupdate-check = {
-        description = "nixos-autoupdate: fetch git repo and detect updates";
+        description = "nixos-autoupdate: poll release pointer and detect updates";
         environment = commonEnv;
         serviceConfig = {
           Type = "oneshot";
@@ -363,21 +369,17 @@ in
         };
       };
 
-      nixos-autoupdate-build = {
-        description = "nixos-autoupdate: build pending configuration";
+      nixos-autoupdate-fetch = {
+        description = "nixos-autoupdate: fetch the released system closure";
         environment = commonEnv;
         serviceConfig = {
           Type = "oneshot";
-          ExecStart = phaseExec "build.sh";
-          CPUWeight = cfg.build.resources.cpuWeight;
-          IOSchedulingClass = cfg.build.resources.ioSchedulingClass;
-          Nice = cfg.build.resources.nice;
-          MemoryHigh = cfg.build.resources.memoryHigh;
+          ExecStart = phaseExec "fetch.sh";
         };
       };
 
       nixos-autoupdate-activate = {
-        description = "nixos-autoupdate: activate built configuration";
+        description = "nixos-autoupdate: activate fetched configuration";
         environment = commonEnv;
         serviceConfig = {
           Type = "oneshot";
@@ -394,6 +396,13 @@ in
         };
       };
     };
+
+    # The host only ever downloads closures, so it needs the cache as a
+    # substituter and its key as trusted. Signatures are always verified.
+    nix.settings = lib.mkMerge [
+      (lib.mkIf (cfg.cache.url != "") { substituters = [ cfg.cache.url ]; })
+      (lib.mkIf (cfg.cache.publicKey != null) { trusted-public-keys = [ cfg.cache.publicKey ]; })
+    ];
 
     environment.systemPackages = [
       pkgs.git

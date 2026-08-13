@@ -17,13 +17,15 @@ export PATH="$RUNTIME_PATH:$PATH"
 status_init
 status_set phase activating
 
-BUILT="$(status_get built_commit)"
+FETCHED="$(status_get fetched_path)"
+DESIRED_COMMIT="$(status_get desired_commit)"
 REBOOT_REQUIRED="$(status_get reboot_required)"
 
 if [ ! -e "$PENDING_SYSTEM" ]; then
-  error "No pending-system build present at $PENDING_SYSTEM"
+  error "No fetched system present at $PENDING_SYSTEM"
   status_error activate "pending-system missing"
-  emit "$ON_APPLY_STATUS" APPLY_FAILED NIX_ERROR "pending-system missing" "$BUILT" "$REBOOT_REQUIRED"
+  emit "$ON_APPLY_STATUS" APPLY_FAILED NIX_ERROR "pending-system missing" \
+    "$DESIRED_COMMIT" "$REBOOT_REQUIRED" "$FETCHED"
   exit 1
 fi
 
@@ -40,7 +42,7 @@ if [ "$NE_EXIT" -ne 0 ]; then
   status_error activate "nix-env --set failed (exit $NE_EXIT)"
   status_settle
   emit "$ON_APPLY_STATUS" APPLY_FAILED NIX_ERROR "Setting system profile failed (exit $NE_EXIT)" \
-    "$BUILT" "$REBOOT_REQUIRED"
+    "$DESIRED_COMMIT" "$REBOOT_REQUIRED" "$TOPLEVEL"
   exit "$NE_EXIT"
 fi
 
@@ -54,12 +56,12 @@ if [ "$SW_EXIT" -ne 0 ]; then
   status_error activate "switch-to-configuration $MODE failed (exit $SW_EXIT)"
   status_settle
   emit "$ON_APPLY_STATUS" APPLY_FAILED NIX_ERROR "Activation failed (exit $SW_EXIT)" \
-    "$BUILT" "$REBOOT_REQUIRED"
+    "$DESIRED_COMMIT" "$REBOOT_REQUIRED" "$TOPLEVEL"
   exit "$SW_EXIT"
 fi
 
-status_set applied_commit "$BUILT"
-echo "$BUILT" > "$LEGACY_APPLIED"
+status_set applied_path "$TOPLEVEL"
+status_set applied_commit "$DESIRED_COMMIT"
 
 # Drop the GC root now that the generation is the system profile.
 rm -f "$PENDING_SYSTEM"
@@ -73,5 +75,6 @@ fi
 status_clear_error
 status_settle
 
-log "Update applied successfully ($BUILT)"
-emit "$ON_APPLY_STATUS" SUCCESS OK "Update applied successfully" "$BUILT" "$REBOOT_REQUIRED"
+log "Update applied successfully ($TOPLEVEL)"
+emit "$ON_APPLY_STATUS" SUCCESS OK "Update applied successfully" \
+  "$DESIRED_COMMIT" "$REBOOT_REQUIRED" "$TOPLEVEL"
