@@ -61,6 +61,10 @@ wait_unit() {
     i=$((i + 1))
     [ "$i" -ge 3600 ] && break
   done
+  # The loop's last body command ([ i -ge 3600 ]) is normally false, so under
+  # `set -e` a bare `wait_unit` call would otherwise abort the caller with the
+  # loop's non-zero status even though the wait succeeded.
+  return 0
 }
 
 start_phase() {

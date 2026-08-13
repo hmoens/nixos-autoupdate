@@ -5,7 +5,12 @@
 # `nix build ...toplevel` is cheap inside the test VM. The fake toplevel ships a
 # switch-to-configuration that records the version and repoints
 # /run/current-system, plus kernel/initrd/... entries that drive the module's
-# reboot-needed comparison. @kerneltarget@ selects whether a reboot is needed:
+# reboot-needed comparison. It also links `sw` to the booted system's `sw` so
+# that after /run/current-system is repointed at this fake toplevel, the NixOS
+# test backdoor's PATH entry `/run/current-system/sw/bin` still resolves to a
+# real, fully-populated bin dir (base64/timeout/nixos-update/...); without it the
+# driver can no longer run any command on the VM.
+# @kerneltarget@ selects whether a reboot is needed:
 #   /run/booted-system/kernel  -> matches booted, no reboot (config-only change)
 #   /run/booted-system/initrd  -> differs from booted, reboot required
 {
@@ -36,6 +41,7 @@
             @coreutils@/bin/ln -s /run/booted-system/initrd $out/initrd
             @coreutils@/bin/ln -s /run/booted-system/kernel-modules $out/kernel-modules
             @coreutils@/bin/ln -s /run/booted-system/kernel-params $out/kernel-params
+            @coreutils@/bin/ln -s /run/booted-system/sw $out/sw
           ''
         ];
       };
