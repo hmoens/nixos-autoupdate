@@ -32,6 +32,19 @@ TOPLEVEL="$(readlink -f "$PENDING_SYSTEM")"
 log "Setting system profile to $TOPLEVEL"
 set +e
 nix-env -p /nix/var/nix/profiles/system --set "$TOPLEVEL"
+NE_EXIT=$?
+set -e
+
+if [ "$NE_EXIT" -ne 0 ]; then
+  error "nix-env --set failed (exit $NE_EXIT)"
+  status_error activate "nix-env --set failed (exit $NE_EXIT)"
+  status_settle
+  emit "$ON_APPLY_STATUS" APPLY_FAILED NIX_ERROR "Setting system profile failed (exit $NE_EXIT)" \
+    "$BUILT" "$REBOOT_REQUIRED"
+  exit "$NE_EXIT"
+fi
+
+set +e
 "$TOPLEVEL/bin/switch-to-configuration" "$MODE"
 SW_EXIT=$?
 set -e

@@ -5,6 +5,7 @@ set -euo pipefail
 STATE_DIR="/var/lib/nixos-mgmt"
 RUN_DIR="/run/nixos-autoupdate"
 STATUS_FILE="$STATE_DIR/status.json"
+STATUS_LOCK="$STATE_DIR/.status.lock"
 HOLD_FILE="$STATE_DIR/hold"
 
 UNITS=(
@@ -72,7 +73,11 @@ start_phase() {
   local phase="$1" block="${2:-}"
   local unit="nixos-autoupdate-$phase.service"
   ensure_run
-  touch "$RUN_DIR/force-$phase"
+  # Only gated phases consume a force flag; check has no gate, so creating
+  # force-check would just leave uncollected litter in RUN_DIR.
+  if [ "$phase" != "check" ]; then
+    touch "$RUN_DIR/force-$phase"
+  fi
   systemctl reset-failed "$unit" 2>/dev/null || true
   if [ "$block" = "--block" ]; then
     systemctl start "$unit" || true
@@ -190,13 +195,18 @@ cmd_phase() {
 
 set_status_hold() {
   [ -f "$STATUS_FILE" ] || return 0
-  local tmp
-  tmp="$(mktemp "$STATE_DIR/.status.XXXXXX")"
-  if jq --argjson v "$1" '.hold=$v' "$STATUS_FILE" > "$tmp"; then
-    mv "$tmp" "$STATUS_FILE"
-  else
-    rm -f "$tmp"
-  fi
+  ensure_run
+  # Serialise against phase writes to status.json (same lock as lib.sh).
+  (
+    flock 9 2>/dev/null || true
+    local tmp
+    tmp="$(mktemp "$STATE_DIR/.status.XXXXXX")"
+    if jq --argjson v "$1" '.hold=$v' "$STATUS_FILE" > "$tmp"; then
+      mv "$tmp" "$STATUS_FILE"
+    else
+      rm -f "$tmp"
+    fi
+  ) 9>>"$STATUS_LOCK"
 }
 
 cmd_hold() {

@@ -9,6 +9,7 @@
 STATE_DIR="/var/lib/nixos-mgmt"
 RUN_DIR="/run/nixos-autoupdate"
 STATUS_FILE="$STATE_DIR/status.json"
+STATUS_LOCK="$STATE_DIR/.status.lock"
 PENDING_SYSTEM="$STATE_DIR/pending-system"
 SENTINEL="$RUN_DIR/reboot-required"
 HOLD_FILE="$STATE_DIR/hold"
@@ -26,11 +27,29 @@ host_ip() {
 
 ensure_dirs() { mkdir -p "$STATE_DIR" "$RUN_DIR"; }
 
+# Run a command while holding an exclusive lock on status.json, serialising the
+# read-modify-write cycle across concurrently running phases (each individual
+# write is already atomic via tmp+mv; the lock prevents lost updates). Falls
+# back to running unlocked if flock is unavailable.
+_with_status_lock() {
+  ensure_dirs
+  (
+    flock 9 2>/dev/null || true
+    "$@"
+  ) 9>>"$STATUS_LOCK"
+}
+
 # Create status.json on first run, seeding applied_commit from the legacy
 # last-applied-commit file so upgrading from the old module does not trigger a
 # spurious rebuild.
 status_init() {
   ensure_dirs
+  [ -f "$STATUS_FILE" ] && return 0
+  _with_status_lock _status_init_write
+}
+
+_status_init_write() {
+  # Re-check under the lock in case another phase created it in the meantime.
   [ -f "$STATUS_FILE" ] && return 0
 
   local applied=""
@@ -64,6 +83,10 @@ status_get() {
 
 _status_apply() {
   # _status_apply <jq-filter> [jq-args...]
+  _with_status_lock _status_write "$@"
+}
+
+_status_write() {
   local filter="$1"; shift
   local tmp
   tmp="$(mktemp "$STATE_DIR/.status.XXXXXX")"

@@ -24,6 +24,7 @@ let
       openssh
       systemd
       diffutils
+      util-linux # flock, for serialising status.json writes in lib.sh
     ]
     ++ lib.optionals (cfg.ageKeyPath != null) [ age ];
 
