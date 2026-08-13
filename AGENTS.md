@@ -1,5 +1,24 @@
 # opencode conventions
 
+## Critical invariant: the target never builds
+
+v2 ships hosts a pre-built **store path** (see DESIGN-v2.md), never a flake or a
+derivation. That is what keeps eval and compile — the parts that thrash small
+machines — off the target entirely. Do not "helpfully" add a fallback that
+builds locally when the cache is missing the closure: the correct behaviour when
+a fetch fails is to defer and retry, and the absence of a `.drv` on the host is
+what makes "never build here" structural rather than a flag.
+
+Related: never pass `--no-check-sigs` to the fetch. Closure signatures are the
+only thing standing between the cache and arbitrary code running as the system.
+
+## Critical invariant: the builder pushes before it points
+
+`nixos-release` must copy the closure to the cache **before** writing/committing
+the release pointer, exactly like pushing an image before moving the tag. A
+pointer that names a closure the cache does not have stalls every host that sees
+it. Keep those two steps in that order.
+
 ## Critical invariant: activation must run in a transient systemd unit
 
 `switch-to-configuration switch` stops/restarts declared units whose definitions

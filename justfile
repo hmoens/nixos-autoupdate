@@ -1,6 +1,13 @@
 check:
     nix flake check
 
+# Shell-lint the phase scripts and the builder-side release tool.
+lint:
+    @for f in scripts/*.sh scripts/nixos-update scripts/nixos-release; do \
+        bash -n "$f" || exit 1; \
+    done
+    @echo "all scripts parse"
+
 test: check
     @echo "Running all tests..."
     @failed=""; \
