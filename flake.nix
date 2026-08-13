@@ -14,6 +14,28 @@
     {
       nixosModules.default = import ./default.nix;
 
+      # The builder-side tool: build a host, publish the closure, move the
+      # pointer. Run it from the config repo, e.g. via `just deploy <host>`.
+      packages = forAllSystems (
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in
+        {
+          nixos-release = pkgs.writeShellApplication {
+            name = "nixos-release";
+            runtimeInputs = with pkgs; [
+              nix
+              git
+              jq
+              coreutils
+            ];
+            text = builtins.readFile ./scripts/nixos-release;
+          };
+          default = self.packages.${system}.nixos-release;
+        }
+      );
+
       checks = forAllSystems (
         system:
         let

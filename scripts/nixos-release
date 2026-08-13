@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# nixos-release: build a host's system closure, publish it to the binary cache,
+# and update that host's release pointer. Run on the BUILDER (laptop / CI), not
+# on the target.
+#
+# Ordering is load-bearing and enforced here: the closure is pushed to the cache
+# BEFORE the pointer commit is written, exactly like pushing a container image
+# before moving the tag. A pointer naming a closure the cache does not have
+# would make every host defer until it appeared.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: nixos-release [options] <host>...
+
+Builds .#nixosConfigurations.<host>.config.system.build.toplevel for each host,
+copies the closure to the cache, writes releases/<host>.json, and commits.
+
+Options:
+  --flake <ref>       Flake holding the nixosConfigurations (default: .)
+  --cache <uri>       Cache to push to, e.g. 's3://bucket' or
+                      'ssh-ng://nas' or 'file:///srv/cache'
+                      (default: $NIXOS_RELEASE_CACHE)
+  --sign-with <key>   Secret key file to sign the closure with (optional when
+                      the cache signs server-side)
+  --operation <op>    Record "switch" or "boot" in the pointer, overriding the
+                      host's activate.mode for this release
+  --releases-dir <d>  Where pointers live (default: releases)
+  --no-commit         Write the pointer files but do not git commit/push
+  --push              git push after committing (default: commit only)
+  -h, --help          This help
+EOF
+}
+
+FLAKE="."
+CACHE="${NIXOS_RELEASE_CACHE:-}"
+SIGN_KEY=""
+OPERATION=""
+RELEASES_DIR="releases"
+DO_COMMIT=1
+DO_PUSH=0
+HOSTS=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --flake)        FLAKE="$2"; shift 2 ;;
+    --cache)        CACHE="$2"; shift 2 ;;
+    --sign-with)    SIGN_KEY="$2"; shift 2 ;;
+    --operation)    OPERATION="$2"; shift 2 ;;
+    --releases-dir) RELEASES_DIR="$2"; shift 2 ;;
+    --no-commit)    DO_COMMIT=0; shift ;;
+    --push)         DO_PUSH=1; shift ;;
+    -h|--help)      usage; exit 0 ;;
+    -*)             echo "nixos-release: unknown option $1" >&2; usage; exit 1 ;;
+    *)              HOSTS+=("$1"); shift ;;
+  esac
+done
+
+if [ "${#HOSTS[@]}" -eq 0 ]; then
+  echo "nixos-release: no host given" >&2
+  usage
+  exit 1
+fi
+
+if [ -z "$CACHE" ]; then
+  echo "nixos-release: no cache configured (--cache or \$NIXOS_RELEASE_CACHE)" >&2
+  exit 1
+fi
+
+case "$OPERATION" in
+  ""|switch|boot) ;;
+  *) echo "nixos-release: --operation must be switch or boot" >&2; exit 1 ;;
+esac
+
+SOURCE_COMMIT="$(git rev-parse HEAD 2>/dev/null || echo "")"
+if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+  echo "nixos-release: WARNING — working tree is dirty; the recorded source" >&2
+  echo "               commit $SOURCE_COMMIT does not describe what was built." >&2
+fi
+
+mkdir -p "$RELEASES_DIR"
+CHANGED=()
+
+for host in "${HOSTS[@]}"; do
+  attr="$FLAKE#nixosConfigurations.$host.config.system.build.toplevel"
+
+  echo "==> $host: building"
+  # Cross-architecture hosts (e.g. aarch64 Pis) are built here too, via qemu
+  # binfmt or a remote builder; only locally-changed derivations are emulated.
+  storePath="$(nix build --no-link --print-out-paths "$attr")"
+  echo "    $storePath"
+
+  echo "==> $host: publishing closure to $CACHE"
+  if [ -n "$SIGN_KEY" ]; then
+    nix store sign --key-file "$SIGN_KEY" --recursive "$storePath"
+  fi
+  # This must complete before the pointer is written.
+  nix copy --to "$CACHE" "$storePath"
+
+  pointer="$RELEASES_DIR/$host.json"
+  system="$(nix eval --raw "$FLAKE#nixosConfigurations.$host.pkgs.stdenv.hostPlatform.system")"
+  jq -n \
+    --arg p "$storePath" \
+    --arg s "$system" \
+    --arg c "$SOURCE_COMMIT" \
+    --arg t "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    --arg o "$OPERATION" \
+    '{ storePath:$p, system:$s, builtFrom:{commit:$c}, builtAt:$t }
+     + (if $o == "" then {} else {operation:$o} end)' \
+    > "$pointer.tmp"
+  mv "$pointer.tmp" "$pointer"
+
+  if git diff --quiet -- "$pointer" 2>/dev/null; then
+    echo "==> $host: unchanged, nothing to release"
+  else
+    echo "==> $host: pointer updated -> $pointer"
+    CHANGED+=("$host")
+  fi
+done
+
+if [ "${#CHANGED[@]}" -eq 0 ]; then
+  echo "Nothing to do: every host already runs the current build."
+  exit 0
+fi
+
+if [ "$DO_COMMIT" = 1 ]; then
+  git add -- "$RELEASES_DIR"
+  git commit -m "release: ${CHANGED[*]}"
+  if [ "$DO_PUSH" = 1 ]; then
+    git push
+    echo "Released: ${CHANGED[*]} (pushed; hosts will pick it up on their next check)"
+  else
+    echo "Released: ${CHANGED[*]} (committed — run 'git push' to roll out)"
+  fi
+else
+  echo "Pointer files written for: ${CHANGED[*]} (not committed)"
+fi
