@@ -48,8 +48,23 @@ let
     RELEASE_FILE='${releaseFile}'
     CACHE_URL='${cfg.cache.url}'
     VERIFY_COMMITS='${lib.boolToString cfg.verifyCommitSignatures}'
-    AGE_KEY_PATH='${lib.optionalString (cfg.ageKeyPath != null) (toString cfg.ageKeyPath)}'
-    GIT_SSH_KEY='${lib.optionalString (cfg.gitSshKey != null) (toString cfg.gitSshKey)}'
+    ${
+      # These two look symmetric and are not. Do not "fix" one to match the other.
+      #
+      # ageKeyPath is the host's PRIVATE identity and must stay a plain runtime
+      # path: `toString` keeps it a literal string, so nothing copies it into
+      # the world-readable store.
+      ""
+    }AGE_KEY_PATH='${lib.optionalString (cfg.ageKeyPath != null) (toString cfg.ageKeyPath)}'
+    ${
+      # gitSshKey is age-encrypted ciphertext that travels WITH the system, so it
+      # is interpolated rather than toString'd: interpolation carries Nix string
+      # context, which is what makes the file a dependency of this config.env and
+      # therefore part of the closure. With `toString` the context is stripped,
+      # the file is not copied to a target that fetches a pre-built closure, and
+      # the check phase dies with "Encrypted SSH key not found".
+      ""
+    }GIT_SSH_KEY='${lib.optionalString (cfg.gitSshKey != null) "${cfg.gitSshKey}"}'
     ON_GIT_STATUS='${optScript "on-git-status" cfg.onGitStatus}'
     ON_APPLY_STATUS='${optScript "on-apply-status" cfg.onApplyStatus}'
     ON_REBOOT_STATUS='${optScript "on-reboot-status" cfg.onRebootStatus}'

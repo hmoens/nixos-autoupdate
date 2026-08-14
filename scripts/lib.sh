@@ -141,6 +141,12 @@ gate_ok() {
 }
 
 # Run a status hook with the AUTOUPDATE_* environment. Never fails the caller.
+#
+# Hooks are user-supplied scripts that reach for whatever they need — curl to
+# push metrics, notify-send, and so on — so they get the system profile on PATH
+# in addition to the agent's own runtime path. Without it a hook only sees the
+# handful of tools the phases themselves use, and fails with "command not found"
+# on everything else.
 emit() {
   # emit <hook-or-empty> <event> <status> <message> <commit> <reboot_required> [store-path]
   # AUTOUPDATE_CHECKED_OUT_COMMIT keeps its name (and the source commit the
@@ -157,6 +163,7 @@ emit() {
   AUTOUPDATE_HOSTNAME="$AU_HOSTNAME" \
   AUTOUPDATE_HOST_IP="$(host_ip)" \
   AUTOUPDATE_PHASE="$PHASE" \
+  PATH="$RUNTIME_PATH:/run/current-system/sw/bin:$PATH" \
     "$hook" || true
 }
 
