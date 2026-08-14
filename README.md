@@ -154,6 +154,7 @@ the host and GC-rooted, so it re-activates with no download at all.
 | `ageKeyPath` | nullOr path | `null` | Age key (agenix + gitSshKey) |
 | `gitSshKey` | nullOr path | `null` | Age-encrypted SSH key for git auth |
 | `check.frequency` | string | `"*-*-* *:0/10:00"` | Pointer poll cadence |
+| `check.randomizedDelaySec` | string | `"60sec"` | Jitter on the check timer, so a fleet does not poll in lockstep |
 | `fetch.gate` | nullOr lines | `null` | Exit 0 to download now, non-zero to defer |
 | `fetch.frequency` | string | `"*-*-* *:0/10:00"` | Deferred-fetch retry cadence |
 | `activate.mode` | enum | `"switch"` | `"switch"` (live) or `"boot"` (stage) |

@@ -207,8 +207,18 @@ in
         frequency = lib.mkOption {
           type = types.str;
           default = "*-*-* *:0/10:00";
-          description = "How often to fetch and check for updates (systemd OnCalendar format)";
+          description = "How often to poll the release pointer (systemd OnCalendar format)";
           example = "*-*-* *:*:00";
+        };
+        randomizedDelaySec = lib.mkOption {
+          type = types.str;
+          default = "60sec";
+          description = ''
+            Jitter added to the check timer, so a fleet does not hit the git
+            remote — and then the cache — in lockstep. Worth keeping, but a delay
+            comparable to the poll interval effectively randomises when the check
+            runs within each cycle, so lower it if you poll frequently.
+          '';
         };
       };
 
@@ -346,7 +356,7 @@ in
         timerConfig = {
           OnCalendar = cfg.check.frequency;
           Persistent = true;
-          RandomizedDelaySec = "60sec";
+          RandomizedDelaySec = cfg.check.randomizedDelaySec;
         };
       };
       nixos-autoupdate-fetch = {
