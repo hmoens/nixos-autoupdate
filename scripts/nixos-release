@@ -93,7 +93,9 @@ if [ -z "$ROOT_ON" ]; then
 fi
 
 SOURCE_COMMIT="$(git rev-parse HEAD 2>/dev/null || echo "")"
-if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+# Only tracked modifications falsify the recorded provenance; untracked files
+# are usually scratch and would otherwise make this warn on every run.
+if [ -n "$(git status --porcelain --untracked-files=no 2>/dev/null)" ]; then
   echo "nixos-release: WARNING — working tree is dirty; the recorded source" >&2
   echo "               commit $SOURCE_COMMIT does not describe what was built." >&2
 fi
@@ -138,7 +140,10 @@ for host in "${HOSTS[@]}"; do
     > "$pointer.tmp"
   mv "$pointer.tmp" "$pointer"
 
-  if git diff --quiet -- "$pointer" 2>/dev/null; then
+  # `git status` rather than `git diff`: diff only considers tracked files, so a
+  # pointer that does not exist yet would look unchanged and the first release of
+  # every host would be silently skipped.
+  if [ -z "$(git status --porcelain -- "$pointer" 2>/dev/null)" ]; then
     echo "==> $host: unchanged, nothing to release"
   else
     echo "==> $host: pointer updated -> $pointer"
