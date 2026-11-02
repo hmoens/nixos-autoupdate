@@ -23,6 +23,10 @@ Options:
                       (default: $NIXOS_RELEASE_CACHE)
   --sign-with <key>   Secret key file to sign the closure with (optional when
                       the cache signs server-side)
+  --build-on <store>  Build in this Nix store instead of the local one, e.g.
+                      'ssh-ng://nas'. Evaluation stays here; only derivations
+                      travel. Pass the cache itself to skip the upload: the
+                      closure is then signed in place.
   --operation <op>    Record "switch" or "boot" in the pointer, overriding the
                       host's activate.mode for this release
   --root-on <host>    Register each published closure as a generation of
@@ -40,6 +44,7 @@ EOF
 FLAKE="."
 CACHE="${NIXOS_RELEASE_CACHE:-}"
 SIGN_KEY=""
+BUILD_ON=""
 OPERATION=""
 RELEASES_DIR="releases"
 ROOT_ON=""
@@ -52,6 +57,7 @@ while [ $# -gt 0 ]; do
     --flake)        FLAKE="$2"; shift 2 ;;
     --cache)        CACHE="$2"; shift 2 ;;
     --sign-with)    SIGN_KEY="$2"; shift 2 ;;
+    --build-on)     BUILD_ON="$2"; shift 2 ;;
     --operation)    OPERATION="$2"; shift 2 ;;
     --root-on)      ROOT_ON="$2"; shift 2 ;;
     --releases-dir) RELEASES_DIR="$2"; shift 2 ;;
@@ -100,6 +106,12 @@ if [ -n "$(git status --porcelain --untracked-files=no 2>/dev/null)" ]; then
   echo "               commit $SOURCE_COMMIT does not describe what was built." >&2
 fi
 
+# Every store operation on the built closure goes to the store that holds it.
+STORE_ARGS=()
+if [ -n "$BUILD_ON" ]; then
+  STORE_ARGS=(--store "$BUILD_ON")
+fi
+
 mkdir -p "$RELEASES_DIR"
 CHANGED=()
 
@@ -109,15 +121,30 @@ for host in "${HOSTS[@]}"; do
   echo "==> $host: building"
   # Cross-architecture hosts (e.g. aarch64 Pis) are built here too, via qemu
   # binfmt or a remote builder; only locally-changed derivations are emulated.
-  storePath="$(nix build --no-link --print-out-paths "$attr")"
+  # With --build-on, the remote store builds and fetches dependencies itself;
+  # --eval-store keeps evaluation and the flake sources here.
+  if [ -n "$BUILD_ON" ]; then
+    storePath="$(nix build --no-link --print-out-paths --eval-store auto "${STORE_ARGS[@]}" "$attr")"
+  else
+    storePath="$(nix build --no-link --print-out-paths "$attr")"
+  fi
   echo "    $storePath"
 
   echo "==> $host: publishing closure to $CACHE"
   if [ -n "$SIGN_KEY" ]; then
-    nix store sign --key-file "$SIGN_KEY" --recursive "$storePath"
+    # Signs where the closure is; the key stays on this machine.
+    nix store sign "${STORE_ARGS[@]}" --key-file "$SIGN_KEY" --recursive "$storePath"
   fi
   # This must complete before the pointer is written.
-  nix copy --to "$CACHE" "$storePath"
+  if [ "$BUILD_ON" = "$CACHE" ]; then
+    # Already there; only confirm it.
+    nix path-info --store "$CACHE" "$storePath" >/dev/null
+  elif [ -n "$BUILD_ON" ]; then
+    # Streams through this machine.
+    nix copy --from "$BUILD_ON" --to "$CACHE" "$storePath"
+  else
+    nix copy --to "$CACHE" "$storePath"
+  fi
 
   if [ "$ROOT_ON" != "none" ] && [ -n "$ROOT_ON" ]; then
     echo "==> $host: pinning on $ROOT_ON so the cache will not collect it"

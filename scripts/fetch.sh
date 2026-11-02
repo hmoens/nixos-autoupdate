@@ -58,8 +58,13 @@ set +e
 if [ -n "$CACHE_URL" ]; then
   # Signatures are checked against trusted-public-keys; --no-check-sigs is
   # deliberately NOT passed.
+  #
+  # No negative narinfo caching: on the cache host itself, a release built
+  # there (nixos-release --build-on) makes the daemon ask the cache for each
+  # new path before building it. Those misses are cached for an hour, in the
+  # same root cache this fetch reads, and the fetch fails until they expire.
   nix --extra-experimental-features nix-command \
-    copy --from "$CACHE_URL" "$DESIRED"
+    copy --option narinfo-cache-negative-ttl 0 --from "$CACHE_URL" "$DESIRED"
 else
   # No explicit cache configured: fall back to the system's substituters.
   nix-store --realise "$DESIRED" >/dev/null
